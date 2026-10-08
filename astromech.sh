@@ -301,7 +301,18 @@ maintain_repo() {
             if (( DRY_RUN )); then
                 info "would commit all changes on '${branch}'"
             else
-                _git "$repo" add -A || { _git "$repo" reset -q; _fail "git add -A failed on '${branch}'"; return; }
+                # '|| true' on the recovery, like the commit branch below.
+                # Without it this was fatal to the WHOLE RUN: errexit applies
+                # inside the { } group, 'add -A' fails on a stale index.lock,
+                # and the 'reset' recovering from it fails for exactly the same
+                # reason — so the script exited 128 right there, printing no
+                # summary and skipping every remaining repository. Under cron
+                # one interrupted git stopped maintenance of everything.
+                _git "$repo" add -A || {
+                    _git "$repo" reset -q || true
+                    _fail "git add -A failed on '${branch}' (a stale .git/index.lock?)"
+                    return
+                }
                 if ! _git "$repo" commit -q -m "wip: auto-commit before astromech maintenance (${stamp})"; then
                     _git "$repo" reset -q || true   # unstage again; the working tree is untouched
                     _fail "commit on '${branch}' failed (hook? identity?) — nothing changed"; return
@@ -347,7 +358,41 @@ maintain_repo() {
     _ok "${joined//,/, }"
 }
 
+# A run lock, so a cron run and a manual one cannot interleave. Two astromech
+# processes in the same repository is one way an index.lock becomes "stale" in
+# the first place: one of them is holding it legitimately while the other
+# reports it as wreckage.
+#
+# A directory, not flock(1): mkdir is atomic everywhere and macOS ships no
+# flock. Under XDG_RUNTIME_DIR when there is one (per-user, tmpfs, cleared on
+# logout), else TMPDIR — which may be shared, hence the uid in the name.
+_LOCK_DIR=""
+_lock_path() { printf '%s/astromech-%s.lock' "${XDG_RUNTIME_DIR:-${TMPDIR:-/tmp}}" "$(id -u)"; }
+
+_run_lock() {
+    local d; d="$(_lock_path)"
+    if mkdir "$d" 2>/dev/null; then
+        printf '%s\n' "$$" > "${d}/pid"; _LOCK_DIR="$d"; return 0
+    fi
+    # Held — or abandoned. A holder that no longer exists must not block
+    # maintenance forever: that turns one killed run into a silent stop.
+    local pid; pid="$(cat "${d}/pid" 2>/dev/null || true)"
+    if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+        return 1
+    fi
+    warn "removing a stale run lock (${d}; pid ${pid:-unknown} is gone)"
+    rm -rf "$d"
+    mkdir "$d" 2>/dev/null || return 1
+    printf '%s\n' "$$" > "${d}/pid"; _LOCK_DIR="$d"
+}
+
+_release_lock() { [[ -n "$_LOCK_DIR" ]] && rm -rf "$_LOCK_DIR"; _LOCK_DIR=""; }
+
 cmd_maintain() {
+    # Taken before discovery so two runs cannot both walk the roots and then
+    # both start writing.
+    _run_lock || error_exit "another ${SCRIPT_NAME} maintenance run is in progress (lock: $(_lock_path)). Wait for it, or remove the lock if you are sure it is dead."
+    trap '_release_lock' EXIT
     load_config
     (( ${#ROOTS[@]} )) || error_exit "No roots configured. Add one: ${SCRIPT_NAME}.sh add-root PATH"
     discover
