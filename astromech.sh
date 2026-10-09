@@ -206,6 +206,14 @@ _abspath() {
     (cd "$p" && pwd)
 }
 
+# _canon PATH — the path with symlinks resolved, or PATH itself if it cannot be
+# entered. Needed only for COMPARING paths, never for storing them: on an
+# ostree host (Fedora Atomic, bazzite) /home is a symlink to /var/home, so a
+# root added as ~/code and a path tab-completed in a shell sitting at
+# /var/home/... are two spellings of one directory. Compared literally, --repo
+# reports "not a discovered repo" about the very directory you are standing in.
+_canon() { ( cd "$1" 2>/dev/null && pwd -P ) || printf '%s' "$1"; }
+
 _has_root() {
     local r
     for r in "${ROOTS[@]}"; do [[ "$r" == "$1" ]] && return 0; done
@@ -470,7 +478,11 @@ _select_targets() {
     local i want
     if [[ -n "$ONLY_REPO" ]]; then
         want="$(_abspath "$ONLY_REPO")" || error_exit "--repo: not a directory: ${ONLY_REPO}"
-        for i in "${!REPO_LIST[@]}"; do [[ "${REPO_LIST[$i]}" == "$want" ]] && TARGETS+=("$i"); done
+        local cwant; cwant="$(_canon "$want")"
+        for i in "${!REPO_LIST[@]}"; do
+            [[ "${REPO_LIST[$i]}" == "$want" || "$(_canon "${REPO_LIST[$i]}")" == "$cwant" ]] \
+                && TARGETS+=("$i")
+        done
         (( ${#TARGETS[@]} )) || error_exit "--repo: ${want} is not a discovered repo (see: ${SCRIPT_NAME}.sh repos)"
     else
         TARGETS=("${!REPO_LIST[@]}")
