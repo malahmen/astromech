@@ -237,7 +237,50 @@ run tidy --repo "$T/nosuchdir" --yes
 check "a path that is not a directory fails"    test "$RC" -ne 0
 check "  saying so, not 'not discovered'"       has "not a directory" "$ERR"
 
-echo "## 9. nothing to do"
+echo "## 9. status lists exactly what tidy would delete"
+# The point of the whole section: status must not have its own idea of
+# "merged". A listing that promises a deletion tidy then refuses, or hides one
+# it would make, is worse than no listing at all — so the two are compared as
+# sets, not spot-checked.
+git -C "$R/plain" branch agree/one origin/main
+git -C "$R/plain" branch agree/two origin/main
+run status
+status_set="$(sed -n 's/^[│ ] *- \([^ ]*\) .*/\1/p' <<<"$OUT" | sort)"
+run tidy --dry-run
+tidy_set="$(sed -n 's/^      \([^ ]*\) .*/\1/p' <<<"$OUT" | sort)"
+check "status and tidy name the same branches" test "$status_set" = "$tidy_set"
+check "  and it is not the empty set"          bash -c '[[ -n "'"$status_set"'" ]]'
+run status
+check "the branch is listed under its repo"    bash -c 'grep -A3 "^├── plain" <<<"$OUT" | grep -q -- "- agree/one"'
+check "  with its short sha"                   bash -c 'grep -qE -- "- agree/one +[0-9a-f]{7}" <<<"$OUT"'
+check "an unmerged branch is NOT listed"       bash -c '! grep -q -- "- unmerged" <<<"$OUT"'
+check "the trunk is NOT listed"                bash -c '! grep -qE "^[│ ] +- main " <<<"$OUT"'
+check "a checked-out branch is NOT listed"     bash -c '! grep -q -- "- current" <<<"$OUT"'
+check "the count is reported"                  has "branch(es) in" "$OUT"
+check "  and points at the command"            has "tidy deletes these" "$OUT"
+# noremote's own merged branch was consumed by section 5, so the weaker-base
+# label needs a fresh one rather than a leftover.
+git -C "$R/noremote" branch weaker main
+run status
+check "a no-origin repo is labelled as weaker" has "no origin" "$OUT"
+check "  and the legend explains it"           has "against its local trunk instead" "$OUT"
+
+# With nothing to tidy the extra legend must not appear at all: a tree that
+# always ends in "0 branch(es) can be tidied" is noise on every run. A root of
+# its own, because this run's other repos still hold branches on purpose —
+# 'behind' keeps one that is IN the plan and that git refuses to delete, which
+# is exactly why status goes on listing it.
+mkdir -p "$T/clean/solo"
+git init -q -b main "$T/clean/solo"
+echo x > "$T/clean/solo/f"; git -C "$T/clean/solo" add f; git -C "$T/clean/solo" commit -qm base
+printf 'onboarded=1\nroot=%s\n' "$T/clean" > "$T/clean.conf"
+OUT="$(ASTROMECH_CONFIG="$T/clean.conf" bash "$AM" status 2>/dev/null)"
+check "no tidy-able branches: no extra legend" bash -c '! grep -q "can be tidied" <<<"$OUT"'
+check "  and no dangling list marker"          bash -c '! grep -q "tidy deletes these" <<<"$OUT"'
+check "  but the dirty legend stays"           has "uncommitted changes" "$OUT"
+check "  and the repo is still shown"          has "solo" "$OUT"
+
+echo "## 10. nothing to do"
 run tidy --repo "$R/wt" --yes
 check "a repo with nothing to tidy exits 0"   test "$RC" -eq 0
 check "  and says so"                         has "Nothing to tidy" "$ERR"

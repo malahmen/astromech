@@ -936,23 +936,54 @@ cmd_config() {
 
 cmd_mark_onboarded() { load_config; ONBOARDED=1; save_config; }
 
-# Plain tree on stdout: per root, its repos (relative path, branch, dirty) and
-# its ignored folders.
+# Plain tree on stdout: per root, its repos (relative path, branch, dirty), the
+# local branches tidy would delete, and its ignored folders.
+#
+# The tidy-able branches come from _tidy_plan_repo — the very function tidy
+# plans with — rather than a second, similar-looking query here. Two
+# implementations of "already merged" would eventually disagree, and status
+# promising a deletion tidy then refuses (or hiding one it would make) is worse
+# than not showing them at all.
 cmd_status() {
     load_config
     (( ${#ROOTS[@]} )) || { echo "(no roots configured)"; return 0; }
     discover
-    local root i entries=() rel br n k last
+    local root i entries=() kids=() rel br n k last cont line idx
+    local total=0 repos_with=0 any_local_base=0
     for root in "${ROOTS[@]}"; do
         printf '%s\n' "${root/#$HOME/\~}"
         if [[ ! -d "$root" ]]; then echo "└── (folder not found)"; echo; continue; fi
-        entries=()
+        entries=(); kids=()
         for i in "${!REPO_LIST[@]}"; do
             [[ "${REPO_ROOT[$i]}" == "$root" ]] || continue
             rel="${REPO_LIST[$i]#"${root}"/}"; [[ "${REPO_LIST[$i]}" == "$root" ]] && rel="."
             br="$(_current_branch "${REPO_LIST[$i]}")" || br="(detached)"
             _is_dirty "${REPO_LIST[$i]}" && br+=" *"
             entries+=("$(printf '%-40s %s' "$rel" "[${br}]")")
+            idx=$(( ${#entries[@]} - 1 ))
+
+            # Costs nothing in the common case: a repo whose only branch is its
+            # trunk plans no work, and the loop below never runs.
+            TIDY_PLAN=(); TIDY_NOTES=()
+            _tidy_plan_repo "${REPO_LIST[$i]}"
+            if (( ${#TIDY_PLAN[@]} )); then
+                repos_with=$(( repos_with + 1 ))
+                local p prepo pbr pbase psha note kidlines=""
+                for p in "${TIDY_PLAN[@]}"; do
+                    IFS=$'\t' read -r prepo pbr pbase <<<"$p"
+                    psha="$(git -C "$prepo" rev-parse --short "refs/heads/${pbr}" 2>/dev/null || echo '?')"
+                    # A base that is not on origin is a weaker claim — the work
+                    # is only known to be on this machine — so it is labelled
+                    # rather than silently mixed in with the rest.
+                    note=""
+                    if [[ "$pbase" != origin/* ]]; then
+                        note="  (vs the local ${pbase} — no origin)"; any_local_base=1
+                    fi
+                    kidlines+="$(printf -- '- %-38s %s%s' "$pbr" "$psha" "$note")"$'\n'
+                    total=$(( total + 1 ))
+                done
+                kids[idx]="${kidlines%$'\n'}"
+            fi
         done
         for i in "${IGNORES[@]}"; do
             [[ "$i" == "${root}/"* ]] && entries+=("${i#"${root}"/}/  (ignored)")
@@ -962,10 +993,20 @@ cmd_status() {
         for k in "${!entries[@]}"; do
             last=$(( k == n - 1 ))
             printf '%s %s\n' "$( (( last )) && echo '└──' || echo '├──')" "${entries[$k]}"
+            [[ -n "${kids[$k]:-}" ]] || continue
+            # The last entry's children hang under nothing, so the guide line
+            # stops with it.
+            cont="$( (( last )) && printf '     ' || printf '│    ')"
+            while IFS= read -r line; do printf '%s%s\n' "$cont" "$line"; done <<<"${kids[$k]}"
         done
         echo
     done
     echo "[branch *] = uncommitted changes"
+    if (( total )); then
+        printf -- '- branch   = already contained in the trunk on origin; %s.sh tidy deletes these\n' "$SCRIPT_NAME"
+        (( any_local_base )) && printf -- '             (where a repo has no origin, against its local trunk instead)\n'
+        printf -- '%d branch(es) in %d repo(s) can be tidied.\n' "$total" "$repos_with"
+    fi
 }
 
 # -----------------------------------------------------------------------------

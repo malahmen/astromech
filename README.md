@@ -74,6 +74,31 @@ Branches that are the trunk, checked out, or held by another worktree never
 appear in the list. Repos mid-rebase, on a detached HEAD, or with no trunk are
 reported and left alone.
 
+`status` shows the same branches under each repo, so you can see what has piled
+up without being asked to delete anything:
+
+```console
+$ astromech.sh status
+~/code
+├── akinn                                    [main]
+├── clonecast                                [main]
+│    - demo/one                               feb962b
+│    - demo/two                               feb962b
+├── nordrassil                               [main *]
+└── younglings-key                           [main]
+     - fix/nss-read-back                      069b6da
+
+[branch *] = uncommitted changes
+- branch   = already contained in the trunk on origin; astromech.sh tidy deletes these
+3 branch(es) in 2 repo(s) can be tidied.
+```
+
+That listing comes from the function `tidy` plans with, not a second
+similar-looking query. Two implementations of "already merged" would eventually
+disagree, and a status that promises a deletion `tidy` then refuses — or hides
+one it would make — is worse than no listing at all. The last two legend lines
+appear only when there is something to list.
+
 ```bash
 astromech.sh tidy --dry-run        # list and stop; never asks
 astromech.sh tidy                  # list, ask, delete
@@ -177,7 +202,7 @@ astromech.sh --help
 | `maintain` | run maintenance on every discovered repo (`--repo`, `--dry-run`, `--tidy`) |
 | `tidy` | list local branches already merged into the trunk, then delete them (`--repo`, `--dry-run`, `--yes`) |
 | `prune [on\|off]` | show or toggle git's `fetch.prune`, with what it does and does not prune, and any repo overriding it (`--dry-run`) |
-| `status` | per root: repos (relative path, branch, `*` if dirty) and ignored folders |
+| `status` | per root: repos (relative path, branch, `*` if dirty), the branches `tidy` would delete, and ignored folders |
 | `roots` / `add-root PATH…` / `remove-root PATH…` | manage roots (`add-root` prints each newly added absolute path; removing one also drops its ignores) |
 | `children ROOT` | ROOT's top-level folders as TSV `name<TAB>ignored(0\|1)` |
 | `ignores` / `set-ignores ROOT [NAME…]` | list / replace a root's ignored top-level folders |
