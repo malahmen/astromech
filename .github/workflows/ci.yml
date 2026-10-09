@@ -25,10 +25,18 @@ jobs:
           bash --version | head -1
           git --version
           shellcheck --version | sed -n 2p
+          # tidy's confirmation gate is exercised with no controlling terminal
+          # (setsid) and with a real one (python's pty); the suite skips those
+          # checks rather than failing if either is missing, so they are worth
+          # seeing in the log.
+          setsid --version
+          python3 -c 'import pty; print("python pty ok")'
 
       - name: shellcheck
+        # Globbed, not listed: a named list quietly stops covering the next
+        # test file somebody adds.
         run: |
-          shellcheck -S warning astromech.sh tests/run-all.sh tests/test-default-branch.sh tests/test-local.sh tests/test-locked.sh 
+          shellcheck -S warning astromech.sh tests/*.sh
 
       - name: tests
         run: tests/run-all.sh
