@@ -251,11 +251,50 @@ _is_dirty() { [[ -n "$(git -C "$1" status --porcelain 2>/dev/null)" ]]; }
 _current_branch() { git -C "$1" symbolic-ref --short -q HEAD 2>/dev/null; }
 
 # main if it exists locally or on origin, else master; nothing → return 1.
+# _default_branch <repo> — the branch this repository considers its trunk.
+#
+# Order matters, and the old order was wrong. It tried 'main' then 'master',
+# accepting either a local OR a remote ref, so a repository mid-rename — a
+# local 'master', with 'main' existing only on origin — was told its default
+# was 'main'. 'master' was then treated as a FEATURE branch: a dirty tree got
+# wip-committed onto it and the run switched away to 'main', and the next push
+# published that wip commit.
+#
+#   1. origin/HEAD, when it names a branch that exists. It is the remote's own
+#      answer and the only one that stays right through a rename.
+#   2. The branch currently checked out, if it is main or master. Whatever
+#      else is true, the trunk you are standing on is not a feature branch.
+#   3. A local main or master.
+#   4. A remote-only main or master, for a repository not yet checked out on
+#      either — the old behaviour, now last instead of first.
 _default_branch() {
-    local b
+    local repo="$1" b head
+
+    head="$(git -C "$repo" symbolic-ref -q --short refs/remotes/origin/HEAD 2>/dev/null || true)"
+    head="${head#origin/}"
+    if [[ -n "$head" ]]; then
+        # Validated, not trusted: origin/HEAD can be a stale symref left
+        # pointing at a branch that has since been deleted, and naming a
+        # branch that does not exist would fail the checkout later instead of
+        # here.
+        if git -C "$repo" show-ref --verify -q "refs/heads/${head}" \
+            || git -C "$repo" show-ref --verify -q "refs/remotes/origin/${head}"; then
+            printf '%s' "$head"; return 0
+        fi
+    fi
+
+    b="$(_current_branch "$repo" || true)"
+    case "$b" in
+        main|master) printf '%s' "$b"; return 0 ;;
+    esac
+
     for b in main master; do
-        if git -C "$1" show-ref --verify -q "refs/heads/${b}" \
-            || git -C "$1" show-ref --verify -q "refs/remotes/origin/${b}"; then
+        if git -C "$repo" show-ref --verify -q "refs/heads/${b}"; then
+            printf '%s' "$b"; return 0
+        fi
+    done
+    for b in main master; do
+        if git -C "$repo" show-ref --verify -q "refs/remotes/origin/${b}"; then
             printf '%s' "$b"; return 0
         fi
     done
