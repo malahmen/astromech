@@ -20,10 +20,18 @@
 # are mid-rebase/merge, on a detached HEAD, or have neither main nor master are
 # skipped and reported, never touched.
 #
-# No prompts: everything is driven by commands and flags, so it drops into a
-# cron job, a systemd timer or a TUI alike. The interactive experience lives in
-# a separate front-end (scomp-link) that drives this engine with flags — the
-# holo-convert / holonet-sync pattern.
+# `tidy` is the other half: it deletes local branches whose work the trunk
+# already holds. Git has no configuration that does this — fetch.prune only
+# touches remote-tracking refs, and a forge's "delete branch on merge" only the
+# branch on the forge — so it is a command, and because it deletes refs it
+# shows the full list first and then asks.
+#
+# Prompt-free by default: everything is driven by commands and flags, so it
+# drops into a cron job, a systemd timer or a TUI alike. tidy is the single
+# exception, and only because it deletes — an unattended run passes --yes to
+# say so out loud, or --dry-run to only list. The interactive experience lives
+# in a separate front-end (scomp-link) that drives this engine with flags —
+# the holo-convert / holonet-sync pattern.
 #
 # Requirements: bash >= 4, git >= 2.13. Run --help for the command list.
 #
@@ -41,7 +49,7 @@ set -euo pipefail
 shopt -s nullglob
 
 SCRIPT_NAME="astromech"
-VERSION="1.0.0"
+VERSION="1.1.0"
 
 # ---- gum-free status output (stderr; stdout stays clean for data) ------------
 _ts() { date -u +%Y-%m-%dT%H:%M:%SZ; }
@@ -82,6 +90,8 @@ MAX_DEPTH="${ASTROMECH_MAX_DEPTH:-6}"
 DRY_RUN=0
 VERBOSE=0
 ONLY_REPO=""
+TIDY=0
+ASSUME_YES=0
 
 # ---- config (filled by load_config) -----------------------------------------
 ROOTS=()
@@ -97,6 +107,7 @@ USAGE
 
 COMMANDS
   maintain                 run maintenance on every repo (or one, with --repo)
+  tidy                     list local branches already merged into the trunk, then delete them
   status                   tree per root: repos (branch, dirty) and ignored folders (stdout)
   roots                    print the configured roots, one per line (stdout)
   add-root PATH...         add folder(s) holding git repos; prints each added (absolute) path (stdout)
@@ -112,8 +123,10 @@ COMMANDS
 
 FLAGS
   --config PATH            config file (default: ${CONFIG_FILE/#$HOME/\~})
-  --repo PATH              maintain: limit to one discovered repo
-  --dry-run                maintain: report what would happen, change nothing
+  --repo PATH              maintain, tidy: limit to one discovered repo
+  --dry-run                maintain, tidy: report what would happen, change nothing
+  --tidy                   maintain: also tidy each repo once its pull has succeeded
+  -y, --yes                tidy: delete without asking (required when there is no terminal)
   -v, --verbose            debug logging
   -h, --help
 
@@ -124,6 +137,13 @@ Per repo, maintain does:
 Nothing is pushed. A failed step leaves the repo as that step left it (a stopped
 rebase stays stopped for you to resolve) and the run moves on. Repos mid-rebase/
 merge, on a detached HEAD, or with neither main nor master are skipped.
+
+tidy prints every local branch already contained in its trunk (as of the last
+fetch) with the repo and the short sha, then asks before deleting any of them.
+Deletion is git branch -d, never -D, so git has to agree too. "Merged" is
+measured against origin/<trunk>, not the local one: a local trunk can be behind
+or hold commits that were never pushed. --dry-run lists and stops; --yes skips
+the question, which an unattended run must pass explicitly.
 Exit status: 0 when no repo failed, 1 otherwise. Logs go to stderr.
 EOF
 }
@@ -427,6 +447,22 @@ _run_lock() {
 
 _release_lock() { [[ -n "$_LOCK_DIR" ]] && rm -rf "$_LOCK_DIR"; _LOCK_DIR=""; }
 
+# Fills TARGETS with indices into REPO_LIST: every discovered repo, or only the
+# one named by --repo. Shared by maintain and tidy so that --repo means the
+# same thing, and fails the same way, in both.
+TARGETS=()
+_select_targets() {
+    TARGETS=()
+    local i want
+    if [[ -n "$ONLY_REPO" ]]; then
+        want="$(_abspath "$ONLY_REPO")" || error_exit "--repo: not a directory: ${ONLY_REPO}"
+        for i in "${!REPO_LIST[@]}"; do [[ "${REPO_LIST[$i]}" == "$want" ]] && TARGETS+=("$i"); done
+        (( ${#TARGETS[@]} )) || error_exit "--repo: ${want} is not a discovered repo (see: ${SCRIPT_NAME}.sh repos)"
+    else
+        TARGETS=("${!REPO_LIST[@]}")
+    fi
+}
+
 cmd_maintain() {
     # Taken before discovery so two runs cannot both walk the roots and then
     # both start writing.
@@ -436,17 +472,19 @@ cmd_maintain() {
     (( ${#ROOTS[@]} )) || error_exit "No roots configured. Add one: ${SCRIPT_NAME}.sh add-root PATH"
     discover
 
-    local targets=() i
-    if [[ -n "$ONLY_REPO" ]]; then
-        local want; want="$(_abspath "$ONLY_REPO")" || error_exit "--repo: not a directory: ${ONLY_REPO}"
-        for i in "${!REPO_LIST[@]}"; do [[ "${REPO_LIST[$i]}" == "$want" ]] && targets+=("$i"); done
-        (( ${#targets[@]} )) || error_exit "--repo: ${want} is not a discovered repo (see: ${SCRIPT_NAME}.sh repos)"
-    else
-        targets=("${!REPO_LIST[@]}")
-    fi
+    local i
+    _select_targets
+    local targets=("${TARGETS[@]}")
     (( ${#targets[@]} )) || { warn "No repositories found under the configured roots."; return 0; }
 
     (( DRY_RUN )) && info "Dry run — nothing will be changed."
+    # Asked once, before the first repo is touched, and not per repo: which
+    # branches become deletable is only known after each pull, so there is no
+    # list to show up front. 'tidy --dry-run' is where the list lives.
+    if (( TIDY )) && ! (( DRY_RUN )); then
+        _tidy_confirm "Also delete local branches already merged into the trunk, in each repo, after its pull?" \
+            || error_exit "declined — nothing was changed. Run '${SCRIPT_NAME}.sh tidy --dry-run' to see what tidy would delete."
+    fi
     info "Maintaining ${#targets[@]} repo(s)…"
 
     local n_ok=0 n_skip=0 n_fail=0 rel lines=()
@@ -456,7 +494,19 @@ cmd_maintain() {
         printf '\n%s%s── %s%s  %s\n' "$(_pfx)" "$C_B" "$rel" "$C_N" "(${REPO_ROOT[$i]/#$HOME/\~})" >&2
         maintain_repo "${REPO_LIST[$i]}"
         case "$R_STATUS" in
-            ok)      n_ok=$((n_ok + 1)) ;;
+            ok)      n_ok=$((n_ok + 1))
+                     # Only after a repo came back clean and up to date: the
+                     # pull is what makes origin/<trunk> current, and tidying
+                     # against a stale one would spare branches it already
+                     # holds. A repo that was skipped or failed keeps all of
+                     # its branches.
+                     if (( TIDY )); then
+                         TIDY_PLAN=(); TIDY_NOTES=()
+                         _tidy_plan_repo "${REPO_LIST[$i]}"
+                         if (( DRY_RUN )); then _tidy_print_plan
+                         else _tidy_apply; fi
+                     fi
+                     ;;
             skipped) n_skip=$((n_skip + 1));  lines+=("skipped  ${REPO_LIST[$i]/#$HOME/\~}: ${R_NOTE}") ;;
             failed)  n_fail=$((n_fail + 1));  lines+=("FAILED   ${REPO_LIST[$i]/#$HOME/\~}: ${R_NOTE}") ;;
         esac
@@ -464,9 +514,187 @@ cmd_maintain() {
 
     printf '\n' >&2
     info "Summary: ${n_ok} ok, ${n_skip} skipped, ${n_fail} failed."
+    if (( TIDY )); then info "Tidy: ${TIDY_DELETED} branch(es) deleted, ${TIDY_FAILED} refused."; fi
     local l
-    for l in "${lines[@]}"; do printf '          %s\n' "$l" >&2; done
-    (( n_fail == 0 ))
+    for l in "${lines[@]}" "${TIDY_LINES[@]}"; do printf '          %s\n' "$l" >&2; done
+    (( n_fail == 0 && TIDY_FAILED == 0 ))
+}
+
+# -----------------------------------------------------------------------------
+# tidy — delete local branches whose work the trunk already holds
+# -----------------------------------------------------------------------------
+#
+# Git has no setting for this, and that is deliberate: a local branch is your
+# own bookmark and git will not collect your bookmarks. (fetch.prune only ever
+# touches remote-tracking refs, and a forge's "delete branch on merge" only the
+# branch on the forge. Neither is this.) So it is a command — but a command
+# that deletes refs has to say what it is about to delete and be told to go
+# ahead, which is what the plan/confirm split below is for.
+#
+# Two things make it safe rather than merely careful:
+#
+#   - "merged" is measured against the trunk ON ORIGIN, not the local one. The
+#     local trunk can be behind, or carry commits that were never pushed; "the
+#     work is on the remote" is the only reading of merged under which losing
+#     the local ref loses nothing.
+#   - deletion is `git branch -d`, never -D. The plan is this script's opinion;
+#     -d is git's own, and a branch has to satisfy both.
+
+TIDY_PLAN=()        # "<repo>\t<branch>\t<base>", in discovery order
+TIDY_NOTES=()       # repos that could not be planned, and why
+TIDY_DELETED=0; TIDY_FAILED=0; TIDY_LINES=()
+
+# _tidy_plan_repo <repo> — appends one TIDY_PLAN entry per local branch of
+# <repo> that is already contained in its trunk. Reads only.
+_tidy_plan_repo() {
+    local repo="$1" op trunk base b wt n=0
+
+    if [[ "$(git -C "$repo" rev-parse --is-inside-work-tree 2>/dev/null)" != true ]]; then
+        TIDY_NOTES+=("${repo}: not a git work tree"); return 0
+    fi
+    op="$(_in_progress "$repo")"
+    [[ -n "$op" ]] && { TIDY_NOTES+=("${repo}: ${op} in progress — left alone"); return 0; }
+    trunk="$(_default_branch "$repo")" || { TIDY_NOTES+=("${repo}: no main or master branch"); return 0; }
+
+    if git -C "$repo" show-ref --verify -q "refs/remotes/origin/${trunk}"; then
+        base="origin/${trunk}"
+    elif git -C "$repo" show-ref --verify -q "refs/heads/${trunk}"; then
+        # No remote at all (or never fetched): the local trunk is the only
+        # answer there is. Said out loud, because it is the weaker one.
+        base="$trunk"
+        TIDY_NOTES+=("${repo}: no origin/${trunk} — measured against the local ${trunk} instead")
+    else
+        TIDY_NOTES+=("${repo}: '${trunk}' exists neither locally nor on origin"); return 0
+    fi
+
+    while IFS=$'\t' read -r b wt; do
+        [[ -n "$b" ]] || continue
+        [[ "$b" == "$trunk" ]] && continue
+        # A branch checked out anywhere — here or in another worktree — has a
+        # worktreepath, and git refuses to delete it. It must not appear in a
+        # list that says it will be deleted.
+        [[ -n "$wt" ]] && continue
+        git -C "$repo" merge-base --is-ancestor "refs/heads/${b}" "$base" 2>/dev/null || continue
+        TIDY_PLAN+=("${repo}"$'\t'"${b}"$'\t'"${base}")
+        n=$(( n + 1 ))
+    done < <(git -C "$repo" for-each-ref --format=$'%(refname:short)\t%(worktreepath)' refs/heads/ 2>/dev/null)
+    dbg "${repo}: ${n} branch(es) contained in ${base}"
+}
+
+# The prediction list. On stdout, like status and repos, so it can be saved,
+# diffed or reviewed before anything happens; commentary stays on stderr.
+# The short sha is the recovery handle: git branch <name> <sha> brings a branch
+# back, and nothing else printed here identifies the commit.
+_tidy_print_plan() {
+    local p repo b base cur="" sha repos=0
+    if (( ${#TIDY_PLAN[@]} )); then
+        printf 'branches already contained in their trunk — these would be deleted:\n\n'
+        for p in "${TIDY_PLAN[@]}"; do
+            IFS=$'\t' read -r repo b base <<< "$p"
+            if [[ "$repo" != "$cur" ]]; then
+                (( repos )) && printf '\n'
+                cur="$repo"; repos=$(( repos + 1 ))
+                printf '  %s  (merged into %s)\n' "${repo/#$HOME/\~}" "$base"
+            fi
+            sha="$(git -C "$repo" rev-parse --short "refs/heads/${b}" 2>/dev/null || echo '?')"
+            printf '      %-44s %s\n' "$b" "$sha"
+        done
+        printf '\n  %d branch(es) in %d repo(s).\n\n' "${#TIDY_PLAN[@]}" "$repos"
+    fi
+    if (( ${#TIDY_NOTES[@]} )); then
+        local note
+        for note in "${TIDY_NOTES[@]}"; do warn "${note/#$HOME/\~}"; done
+    fi
+}
+
+# _tidy_confirm <question> — 0 go ahead, 1 could not ask, 2 declined.
+#
+# Those last two must not share a status. Declining is a choice and the run
+# ends fine; being unable to ask is a request that did not happen, and a cron
+# job or a front-end has to hear about it rather than read a clean exit as "no
+# branches needed deleting".
+#
+# A run with no terminal (cron, a systemd timer, scomp-link driving the engine)
+# cannot be asked, so it has to carry --yes: silence is not consent. Note this
+# OPENS /dev/tty rather than testing it — a process with no controlling
+# terminal still has a /dev/tty that passes -r and -c, and the read then fails
+# on a question nobody was shown.
+_tidy_confirm() {
+    local q="$1" ans=""
+    (( ASSUME_YES )) && return 0
+    ( : <>/dev/tty ) 2>/dev/null || {
+        error "no terminal to confirm on, and --yes was not given."
+        error "Re-run with --yes to delete without asking, or --dry-run to only list."
+        return 1
+    }
+    printf '%s [y/N] ' "$q" >/dev/tty
+    IFS= read -r ans </dev/tty || ans=""
+    case "$ans" in
+        y|Y|yes|YES|Yes) return 0 ;;
+        *) info "Declined — nothing deleted."; return 2 ;;
+    esac
+}
+
+# _tidy_apply — deletes everything in TIDY_PLAN, one branch at a time.
+_tidy_apply() {
+    local p repo b base sha
+    for p in "${TIDY_PLAN[@]}"; do
+        IFS=$'\t' read -r repo b base <<< "$p"
+        sha="$(git -C "$repo" rev-parse --short "refs/heads/${b}" 2>/dev/null || echo '?')"
+        if _git "$repo" branch -d "$b"; then
+            TIDY_DELETED=$(( TIDY_DELETED + 1 ))
+            info "deleted ${b} (was ${sha}) in ${repo/#$HOME/\~}"
+        else
+            # git's -d test is narrower than this plan's: it asks whether the
+            # branch is contained in HEAD or in its own upstream, so a local
+            # trunk sitting behind origin's can make it refuse a branch that
+            # origin's trunk demonstrably holds. Reported, never forced — -D
+            # is the operator's call, and the sha above is enough to recover
+            # either way.
+            TIDY_FAILED=$(( TIDY_FAILED + 1 ))
+            TIDY_LINES+=("REFUSED  ${repo/#$HOME/\~}: ${b} (${sha}) — git -C ${repo/#$HOME/\~} branch -D ${b}  # contained in ${base}")
+        fi
+    done
+}
+
+cmd_tidy() {
+    _run_lock || error_exit "another ${SCRIPT_NAME} run is in progress (lock: $(_lock_path)). Wait for it, or remove the lock if you are sure it is dead."
+    trap '_release_lock' EXIT
+    load_config
+    (( ${#ROOTS[@]} )) || error_exit "No roots configured. Add one: ${SCRIPT_NAME}.sh add-root PATH"
+    discover
+    _select_targets
+    (( ${#TARGETS[@]} )) || { warn "No repositories found under the configured roots."; return 0; }
+
+    # Nothing is fetched here, on purpose: tidy must not reach the network to
+    # decide what to delete. It therefore measures against whatever origin/
+    # trunk was last fetched, which can only make it see FEWER branches as
+    # merged, never more. 'maintain --tidy' pulls first and so sees all of them.
+    TIDY_PLAN=(); TIDY_NOTES=()
+    local i
+    for i in "${TARGETS[@]}"; do _tidy_plan_repo "${REPO_LIST[$i]}"; done
+
+    _tidy_print_plan
+    (( ${#TIDY_PLAN[@]} )) || { info "Nothing to tidy: no local branch is already contained in its trunk."; return 0; }
+    if (( DRY_RUN )); then
+        info "Dry run — nothing was deleted."
+        return 0
+    fi
+    local gate=0
+    _tidy_confirm "Delete ${#TIDY_PLAN[@]} merged branch(es)?" || gate=$?
+    case "$gate" in
+        0) ;;
+        2) return 0 ;;   # declined — nothing was asked of git, nothing failed
+        *) return 1 ;;   # could not ask: a deletion was requested and did not happen
+    esac
+    _tidy_apply
+    printf '\n' >&2
+    info "Summary: ${TIDY_DELETED} deleted, ${TIDY_FAILED} refused."
+    if (( ${#TIDY_LINES[@]} )); then
+        local l
+        for l in "${TIDY_LINES[@]}"; do printf '          %s\n' "$l" >&2; done
+    fi
+    (( TIDY_FAILED == 0 ))
 }
 
 # -----------------------------------------------------------------------------
@@ -596,6 +824,8 @@ main() {
             --repo)       [[ $# -ge 2 ]] || error_exit "--repo needs a PATH"; ONLY_REPO="$2"; shift 2 ;;
             --repo=*)     ONLY_REPO="${1#*=}"; shift ;;
             --dry-run)    DRY_RUN=1; shift ;;
+            --tidy)       TIDY=1; shift ;;
+            -y|--yes)     ASSUME_YES=1; shift ;;
             -v|--verbose) VERBOSE=1; shift ;;
             -h|--help)    usage; exit 0 ;;
             --)           shift; args+=("$@"); break ;;
@@ -606,6 +836,7 @@ main() {
 
     case "$cmd" in
         maintain)       cmd_maintain ;;
+        tidy)           cmd_tidy ;;
         status)         cmd_status ;;
         roots)          cmd_roots ;;
         add-root)       cmd_add_root "${args[@]}" ;;

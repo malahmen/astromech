@@ -24,9 +24,80 @@ These repos are **skipped and reported**, never touched:
 - detached HEAD
 - neither `main` nor `master` exists, locally or on `origin`
 
+## Tidy
+
+`tidy` is the other half: it deletes local branches whose work the trunk
+already holds — the ones left behind after a PR is merged and the forge deletes
+its own copy.
+
+Git has **no configuration that does this**, and the settings people reach
+for are not it:
+
+| Setting | What it actually prunes |
+| --- | --- |
+| `git config --global fetch.prune true` | stale `origin/*` **remote-tracking refs** on fetch |
+| A forge's *delete branch on merge* | the branch **on the forge** |
+| — | nothing deletes merged **local** branches; that needs a command |
+
+So `tidy` prints every branch it would delete, with the repo and the short sha,
+and then asks:
+
+```console
+$ astromech.sh tidy
+branches already contained in their trunk — these would be deleted:
+
+  ~/code/astromech  (merged into origin/main)
+      ci/github-actions                            4055a00
+      fix/lock-handling                            afdef48
+
+  ~/code/nordrassil  (merged into origin/main)
+      test/port-harnesses                          83b9d1f
+
+  3 branch(es) in 2 repo(s).
+
+Delete 3 merged branch(es)? [y/N]
+```
+
+Two things make it safe rather than merely careful:
+
+- **"Merged" means contained in `origin/<trunk>`, not the local one.** A local
+  trunk can be behind, or carry a merge commit that was never pushed. Measuring
+  against it would call a branch merged on the strength of work nobody else
+  has.
+- **Deletion is `git branch -d`, never `-D`.** The list is astromech's opinion;
+  `-d` is git's own, and a branch has to satisfy both. Where git refuses one the
+  plan contained, the run says so, prints the `-D` command, exits non-zero and
+  leaves the branch alone — forcing it is the operator's decision, not a
+  script's.
+
+Branches that are the trunk, checked out, or held by another worktree never
+appear in the list. Repos mid-rebase, on a detached HEAD, or with no trunk are
+reported and left alone.
+
+```bash
+astromech.sh tidy --dry-run        # list and stop; never asks
+astromech.sh tidy                  # list, ask, delete
+astromech.sh tidy --yes            # delete without asking
+astromech.sh tidy --repo ~/code/api
+astromech.sh maintain --tidy       # pull every repo first, then tidy it
+```
+
+`tidy` never touches the network, so it measures against whatever `origin/`
+was last fetched — which can only make it see *fewer* branches as merged, never
+more. `maintain --tidy` pulls each repo first and so sees all of them; it asks
+once, before the first repo, because which branches become deletable is only
+known after each pull (`tidy --dry-run` is where the list lives).
+
+An unattended run must pass `--yes` explicitly. With no terminal to ask on and
+no `--yes`, tidy refuses and exits non-zero rather than assume consent — and
+rather than exit 0 as if there had been nothing to delete.
+
+## Front-end
+
 The interactive experience (first-run setup, multi-select ignore picker, menu)
-lives in the [scomp-link](https://github.com/malahmen/scomp-link) front-end;
-this engine has no prompts, so it also runs from cron or a systemd timer.
+lives in the [scomp-link](https://github.com/malahmen/scomp-link) front-end.
+Apart from tidy's confirmation, this engine has no prompts, so it also runs
+from cron or a systemd timer.
 
 ## Requirements
 
@@ -43,12 +114,15 @@ astromech.sh status                          # tree: repos [branch *dirty] + ign
 astromech.sh maintain --dry-run              # what would happen
 astromech.sh maintain                        # do it
 astromech.sh maintain --repo ~/code/api      # just one repo
+astromech.sh tidy --dry-run                  # merged local branches, listed
+astromech.sh tidy                            # …then ask, then delete them
 astromech.sh --help
 ```
 
 | Command | Does |
 | --- | --- |
-| `maintain` | run maintenance on every discovered repo (`--repo`, `--dry-run`) |
+| `maintain` | run maintenance on every discovered repo (`--repo`, `--dry-run`, `--tidy`) |
+| `tidy` | list local branches already merged into the trunk, then delete them (`--repo`, `--dry-run`, `--yes`) |
 | `status` | per root: repos (relative path, branch, `*` if dirty) and ignored folders |
 | `roots` / `add-root PATH…` / `remove-root PATH…` | manage roots (`add-root` prints each newly added absolute path; removing one also drops its ignores) |
 | `children ROOT` | ROOT's top-level folders as TSV `name<TAB>ignored(0\|1)` |
@@ -59,8 +133,10 @@ astromech.sh --help
 
 Exit status: `maintain` exits 0 when no repo failed and 1 otherwise. Skipped
 repos don't count as failures, so a repo that only has `develop` doesn't make
-every cron run fail. Logs go to stderr. `status`, `roots`, `repos`, `children`,
-`ignores`, `config` and `add-root` print their data to stdout.
+every cron run fail. `tidy` exits 0 when every planned deletion happened or you
+declined, and 1 when git refused one or there was no way to ask. Logs go to
+stderr. `status`, `roots`, `repos`, `children`, `ignores`, `config`, `add-root`
+and tidy's plan print their data to stdout.
 
 ## Discovery
 
@@ -97,3 +173,7 @@ set, so an HTTPS remote that needs credentials fails instead of hanging the run.
 ```bash
 tests/run-all.sh      # file:// bare remotes, no network
 ```
+
+`test-tidy.sh` needs `setsid` to observe the confirmation gate refusing with no
+controlling terminal, and python's `pty` to answer the question with one. It
+skips those checks, rather than failing, where either is missing.
