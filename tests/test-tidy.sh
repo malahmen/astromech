@@ -224,7 +224,20 @@ run maintain --repo "$R/plain" --tidy --dry-run
 check "maintain --tidy --dry-run only lists"  have "$R/plain" unmerged
 check "  and asks nothing"                    bash -c '! grep -q "Delete .* merged" <<<"$ERR"'
 
-echo "## 8. nothing to do"
+echo "## 8. --repo accepts either spelling of a symlinked path"
+# /home is a symlink to /var/home on an ostree host, so the configured root and
+# a path from a shell can differ while naming one directory. Reproduced with a
+# symlink to the root rather than relying on the host having one.
+git -C "$R/plain" branch spelling origin/main
+ln -s "$R" "$T/link"
+run tidy --repo "$T/link/plain" --yes
+check "a symlinked path resolves to the repo"   test "$RC" -eq 0
+check "  and its merged branch is deleted"      gone "$R/plain" spelling
+run tidy --repo "$T/nosuchdir" --yes
+check "a path that is not a directory fails"    test "$RC" -ne 0
+check "  saying so, not 'not discovered'"       has "not a directory" "$ERR"
+
+echo "## 9. nothing to do"
 run tidy --repo "$R/wt" --yes
 check "a repo with nothing to tidy exits 0"   test "$RC" -eq 0
 check "  and says so"                         has "Nothing to tidy" "$ERR"

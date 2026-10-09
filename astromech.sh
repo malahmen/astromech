@@ -206,6 +206,14 @@ _abspath() {
     (cd "$p" && pwd)
 }
 
+# _canon PATH — the path with symlinks resolved, or PATH itself if it cannot be
+# entered. Needed only for COMPARING paths, never for storing them: on an
+# ostree host (Fedora Atomic, bazzite) /home is a symlink to /var/home, so a
+# root added as ~/code and a path tab-completed in a shell sitting at
+# /var/home/... are two spellings of one directory. Compared literally, --repo
+# reports "not a discovered repo" about the very directory you are standing in.
+_canon() { ( cd "$1" 2>/dev/null && pwd -P ) || printf '%s' "$1"; }
+
 _has_root() {
     local r
     for r in "${ROOTS[@]}"; do [[ "$r" == "$1" ]] && return 0; done
@@ -470,7 +478,11 @@ _select_targets() {
     local i want
     if [[ -n "$ONLY_REPO" ]]; then
         want="$(_abspath "$ONLY_REPO")" || error_exit "--repo: not a directory: ${ONLY_REPO}"
-        for i in "${!REPO_LIST[@]}"; do [[ "${REPO_LIST[$i]}" == "$want" ]] && TARGETS+=("$i"); done
+        local cwant; cwant="$(_canon "$want")"
+        for i in "${!REPO_LIST[@]}"; do
+            [[ "${REPO_LIST[$i]}" == "$want" || "$(_canon "${REPO_LIST[$i]}")" == "$cwant" ]] \
+                && TARGETS+=("$i")
+        done
         (( ${#TARGETS[@]} )) || error_exit "--repo: ${want} is not a discovered repo (see: ${SCRIPT_NAME}.sh repos)"
     else
         TARGETS=("${!REPO_LIST[@]}")
@@ -781,7 +793,10 @@ _prune_scan() {
     [[ -n "$out" ]] || return 0
     printf '%s\n' "$out"
     n="$(wc -l <<<"$out" | tr -d ' ')"
-    warn "${n} local override(s) above; a repo-local value and remote.origin.prune both beat the global setting."
+    # Not "above": the override lines go to stdout and this to stderr, so a
+    # front-end that captures one and streams the other can show them in
+    # either order. The warning has to stand on its own.
+    warn "fetch.prune is overridden locally in ${n} place(s); a repo-local value and remote.origin.prune both beat the global setting."
 }
 
 cmd_prune() {
@@ -823,7 +838,10 @@ cmd_prune() {
                 else
                     info "Undo with: git config --global --unset fetch.prune"
                 fi
-                _prune_explain
+                # No explanation here. 'prune' with no argument is the command
+                # that teaches; someone typing 'prune on' has already decided,
+                # and twelve lines of why is noise they did not ask for — and
+                # a duplicate when a front-end showed the state first.
             fi
             # Read back rather than echo the intent: what is reported is what
             # the config now says, which in a dry run is the unchanged value.

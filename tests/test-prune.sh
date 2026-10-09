@@ -76,7 +76,7 @@ check "a repo-local fetch.prune is reported"  ovr offlocal fetch.prune false
 check "remote.origin.prune is reported too"   ovr offremote remote.origin.prune false
 check "a repo setting neither is not"         bash -c '! grep -q "clean" <<<"$OUT"'
 check "and it says they beat the global one"  has "beat the global setting" "$ERR"
-check "counted"                               has "2 local override(s)" "$ERR"
+check "counted"                               has "overridden locally in 2 place(s)" "$ERR"
 
 echo "## 3. the toggle writes, and says the way back"
 run prune on
@@ -85,7 +85,7 @@ check "the global config now says true"       test "$(gval)" = true
 check "the transition is reported"            has "unset -> true" "$ERR"
 check "the undo is an --unset, as it was"     has "git config --global --unset fetch.prune" "$ERR"
 check "the read-back is on stdout"            bash -c '[[ "$OUT" == *"fetch.prune=true"* ]]'
-check "the explanation comes with the change" has "stale origin/* remote-tracking refs" "$ERR"
+check "the change does NOT re-explain"      bash -c '! grep -q "stale origin/\* remote-tracking refs" <<<"$ERR"'
 
 echo "## 4. a no-op is a no-op"
 run prune on
