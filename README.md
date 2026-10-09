@@ -35,7 +35,7 @@ for are not it:
 
 | Setting | What it actually prunes |
 | --- | --- |
-| `git config --global fetch.prune true` | stale `origin/*` **remote-tracking refs** on fetch |
+| `fetch.prune` (see [`prune`](#prune) below) | stale `origin/*` **remote-tracking refs** on fetch |
 | A forge's *delete branch on merge* | the branch **on the forge** |
 | — | nothing deletes merged **local** branches; that needs a command |
 
@@ -92,6 +92,59 @@ An unattended run must pass `--yes` explicitly. With no terminal to ask on and
 no `--yes`, tidy refuses and exits non-zero rather than assume consent — and
 rather than exit 0 as if there had been nothing to delete.
 
+## Prune
+
+The setting next door, and the one people mean when they ask whether git can
+do tidy's job. It can't — but it can do the *other* half, and `prune` is where
+that distinction is spelled out instead of assumed:
+
+```console
+$ astromech.sh prune
+fetch.prune=unset
+[info]  fetch.prune is unset, and git's own default is off — nothing is pruned.
+          prunes:    stale origin/* remote-tracking refs, at every fetch. And
+                     maintain's 'git pull --rebase' is a fetch, so maintenance
+                     does it for you.
+          does not:  local branches. No git setting deletes those — that is
+                     'astromech.sh tidy'. Nor tags: that is
+                     fetch.pruneTags, which this toggle leaves alone.
+          why:       with a forge deleting each head branch as its PR lands,
+                     every merged branch leaves an origin/* ref behind, and
+                     'git branch -a', tab completion and your tooling go on
+                     offering branches that are gone.
+[info]  Turn it on with: astromech.sh prune on
+```
+
+```bash
+astromech.sh prune            # the state, the explanation, and any overrides
+astromech.sh prune on         # git config --global fetch.prune true
+astromech.sh prune off        # …false
+astromech.sh prune on --dry-run
+```
+
+Toggling prints the transition and the exact way back —
+`fetch.prune: unset -> true (global)` followed by
+`Undo with: git config --global --unset fetch.prune`, or the previous value
+where there was one. The value reported on stdout is **read back** from the
+config afterwards, not echoed from the intent, so a dry run reports what is
+still there.
+
+It also scans the discovered repos for the two settings that quietly beat a
+global one — a repo-local `fetch.prune`, and `remote.origin.prune`, which
+overrides `fetch.prune` at any scope:
+
+```
+override=/home/me/code/legacy	remote.origin.prune	false
+[warn]  1 local override(s) above; a repo-local value and remote.origin.prune
+        both beat the global setting.
+```
+
+Otherwise that's a thing you find out by wondering why one repo never prunes.
+
+`fetch.pruneTags` is deliberately **not** offered: it prunes local tags the
+remote no longer has, which is a much bigger promise than dropping a stale
+branch ref, and nothing here needs it.
+
 ## Front-end
 
 The interactive experience (first-run setup, multi-select ignore picker, menu)
@@ -123,6 +176,7 @@ astromech.sh --help
 | --- | --- |
 | `maintain` | run maintenance on every discovered repo (`--repo`, `--dry-run`, `--tidy`) |
 | `tidy` | list local branches already merged into the trunk, then delete them (`--repo`, `--dry-run`, `--yes`) |
+| `prune [on\|off]` | show or toggle git's `fetch.prune`, with what it does and does not prune, and any repo overriding it (`--dry-run`) |
 | `status` | per root: repos (relative path, branch, `*` if dirty) and ignored folders |
 | `roots` / `add-root PATH…` / `remove-root PATH…` | manage roots (`add-root` prints each newly added absolute path; removing one also drops its ignores) |
 | `children ROOT` | ROOT's top-level folders as TSV `name<TAB>ignored(0\|1)` |
@@ -173,6 +227,10 @@ set, so an HTTPS remote that needs credentials fails instead of hanging the run.
 ```bash
 tests/run-all.sh      # file:// bare remotes, no network
 ```
+
+`test-prune.sh` writes to a global git config, so it first proves git honours
+`$GIT_CONFIG_GLOBAL` (2.32+) and skips itself if not — the real `~/.gitconfig`
+is not an acceptable place to find that out.
 
 `test-tidy.sh` needs `setsid` to observe the confirmation gate refusing with no
 controlling terminal, and python's `pty` to answer the question with one. It

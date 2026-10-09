@@ -26,6 +26,11 @@
 # branch on the forge — so it is a command, and because it deletes refs it
 # shows the full list first and then asks.
 #
+# `prune` is the setting next door, and the one people confuse with tidy:
+# fetch.prune drops stale origin/* REMOTE-TRACKING refs on fetch, while nothing
+# in git deletes merged LOCAL branches. It shows the state and the reason, and
+# toggles the global value.
+#
 # Prompt-free by default: everything is driven by commands and flags, so it
 # drops into a cron job, a systemd timer or a TUI alike. tidy is the single
 # exception, and only because it deletes — an unattended run passes --yes to
@@ -108,6 +113,7 @@ USAGE
 COMMANDS
   maintain                 run maintenance on every repo (or one, with --repo)
   tidy                     list local branches already merged into the trunk, then delete them
+  prune [on|off]           show or toggle git's fetch.prune (stale origin/* refs), with why
   status                   tree per root: repos (branch, dirty) and ignored folders (stdout)
   roots                    print the configured roots, one per line (stdout)
   add-root PATH...         add folder(s) holding git repos; prints each added (absolute) path (stdout)
@@ -126,6 +132,7 @@ FLAGS
   --repo PATH              maintain, tidy: limit to one discovered repo
   --dry-run                maintain, tidy: report what would happen, change nothing
   --tidy                   maintain: also tidy each repo once its pull has succeeded
+  --dry-run                prune: report the change, write nothing
   -y, --yes                tidy: delete without asking (required when there is no terminal)
   -v, --verbose            debug logging
   -h, --help
@@ -137,6 +144,13 @@ Per repo, maintain does:
 Nothing is pushed. A failed step leaves the repo as that step left it (a stopped
 rebase stays stopped for you to resolve) and the run moves on. Repos mid-rebase/
 merge, on a detached HEAD, or with neither main nor master are skipped.
+
+prune is the adjacent git setting, and the distinction people trip over:
+fetch.prune drops stale origin/* REMOTE-TRACKING refs on every fetch, and
+nothing at all configures the deletion of merged LOCAL branches — that is tidy.
+'prune' alone shows the current state, what it does and does not prune, and any
+repository that overrides it locally; 'prune on|off' writes the global setting
+and prints the way back.
 
 tidy prints every local branch already contained in its trunk (as of the last
 fetch) with the repo and the short sha, then asks before deleting any of them.
@@ -698,6 +712,129 @@ cmd_tidy() {
 }
 
 # -----------------------------------------------------------------------------
+# prune — the one git setting adjacent to tidy's job
+# -----------------------------------------------------------------------------
+#
+# tidy deletes local branches. This deletes nothing: fetch.prune makes git drop
+# the REMOTE-TRACKING refs (origin/*) of branches that no longer exist on the
+# remote, at every fetch — and maintain's `git pull --rebase` is a fetch, so
+# with it on, maintenance does the pruning as a side effect.
+#
+# It lives here because it is the question tidy always raises — "isn't there a
+# config for this?" — and the answer has two halves that are constantly
+# confused with each other:
+#
+#   the remote-tracking half   yes: fetch.prune, this toggle
+#   the local-branch half      no: nothing configures it, that is tidy
+#
+# Keeping both in one command is the only way that distinction gets made
+# somewhere a person will actually read it.
+#
+# Deliberately not offered: fetch.pruneTags. It prunes local tags the remote no
+# longer has, which is a far bigger promise than dropping a stale branch ref,
+# and nothing in astromech needs it.
+
+_prune_global() { git config --global --get fetch.prune 2>/dev/null || true; }
+_prune_true()   { case "${1,,}" in true|yes|on|1) return 0 ;; *) return 1 ;; esac; }
+
+# The explanation goes to stderr so the key=value report on stdout stays
+# parseable — the same split as every other command here.
+_prune_explain() {
+    cat >&2 <<EOF
+          prunes:    stale origin/* remote-tracking refs, at every fetch. And
+                     maintain's 'git pull --rebase' is a fetch, so maintenance
+                     does it for you.
+          does not:  local branches. No git setting deletes those — that is
+                     '${SCRIPT_NAME}.sh tidy'. Nor tags: that is
+                     fetch.pruneTags, which this toggle leaves alone.
+          why:       with a forge deleting each head branch as its PR lands,
+                     every merged branch leaves an origin/* ref behind, and
+                     'git branch -a', tab completion and your tooling go on
+                     offering branches that are gone.
+EOF
+}
+
+# _prune_overrides — one 'override=<repo><TAB><key><TAB><value>' line per
+# discovered repo that sets pruning locally.
+#
+# Both keys are checked because both beat the global one: a repo-local
+# fetch.prune overrides the global fetch.prune, and remote.<name>.prune
+# overrides fetch.prune at any scope. Either can silently defeat this toggle in
+# one repo, which is otherwise a thing you work out by wondering why.
+_prune_overrides() {
+    local i repo v
+    for i in "${!REPO_LIST[@]}"; do
+        repo="${REPO_LIST[$i]}"
+        v="$(git -C "$repo" config --local --get fetch.prune 2>/dev/null || true)"
+        [[ -n "$v" ]] && printf 'override=%s\t%s\t%s\n' "$repo" "fetch.prune" "$v"
+        v="$(git -C "$repo" config --local --get remote.origin.prune 2>/dev/null || true)"
+        [[ -n "$v" ]] && printf 'override=%s\t%s\t%s\n' "$repo" "remote.origin.prune" "$v"
+    done
+    return 0
+}
+
+_prune_scan() {
+    (( ${#ROOTS[@]} )) || { info "No roots configured, so no repositories were checked for local overrides."; return 0; }
+    discover
+    local out n
+    out="$(_prune_overrides)"
+    [[ -n "$out" ]] || return 0
+    printf '%s\n' "$out"
+    n="$(wc -l <<<"$out" | tr -d ' ')"
+    warn "${n} local override(s) above; a repo-local value and remote.origin.prune both beat the global setting."
+}
+
+cmd_prune() {
+    (( $# <= 1 )) || error_exit "prune: expected 'on', 'off', or nothing (to show the current state)."
+    load_config
+    local want="${1:-}" cur curbool new
+    cur="$(_prune_global)"
+    curbool="unset"
+    if [[ -n "$cur" ]]; then
+        if _prune_true "$cur"; then curbool=true; else curbool=false; fi
+    fi
+
+    case "$want" in
+        ""|show)
+            printf 'fetch.prune=%s\n' "${cur:-unset}"
+            case "$curbool" in
+                true)  success "git prunes stale remote-tracking refs on fetch (fetch.prune=${cur}, global)." ;;
+                false) warn "pruning is explicitly OFF (fetch.prune=${cur}, global)." ;;
+                *)     info "fetch.prune is unset, and git's own default is off — nothing is pruned." ;;
+            esac
+            _prune_explain
+            _prune_scan
+            [[ "$curbool" == true ]] || info "Turn it on with: ${SCRIPT_NAME}.sh prune on"
+            ;;
+        on|off)
+            new=true; [[ "$want" == off ]] && new=false
+            if [[ "$curbool" == "$new" ]]; then
+                info "fetch.prune is already ${new} (global) — nothing changed."
+            elif (( DRY_RUN )); then
+                info "would set fetch.prune=${new} (global); it is ${curbool} now."
+            else
+                git config --global fetch.prune "$new" \
+                    || error_exit "could not write fetch.prune to the global git config ($(git config --global --list --show-origin 2>/dev/null | sed -n 1p | cut -f1 || echo 'path unknown'))."
+                success "fetch.prune: ${curbool} -> ${new} (global)"
+                # The exact way back, including the case where there was no
+                # line at all before this.
+                if [[ -n "$cur" ]]; then
+                    info "Undo with: git config --global fetch.prune ${cur}"
+                else
+                    info "Undo with: git config --global --unset fetch.prune"
+                fi
+                _prune_explain
+            fi
+            # Read back rather than echo the intent: what is reported is what
+            # the config now says, which in a dry run is the unchanged value.
+            printf 'fetch.prune=%s\n' "$(_prune_global || true)"
+            _prune_scan
+            ;;
+        *)  error_exit "prune: expected 'on', 'off', or nothing (to show the current state); got '${want}'." ;;
+    esac
+}
+
+# -----------------------------------------------------------------------------
 # Config commands
 # -----------------------------------------------------------------------------
 
@@ -837,6 +974,7 @@ main() {
     case "$cmd" in
         maintain)       cmd_maintain ;;
         tidy)           cmd_tidy ;;
+        prune)          cmd_prune "${args[@]}" ;;
         status)         cmd_status ;;
         roots)          cmd_roots ;;
         add-root)       cmd_add_root "${args[@]}" ;;
