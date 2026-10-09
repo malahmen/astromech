@@ -297,3 +297,7 @@ is not an acceptable place to find that out.
 `test-tidy.sh` needs `setsid` to observe the confirmation gate refusing with no
 controlling terminal, and python's `pty` to answer the question with one. It
 skips those checks, rather than failing, where either is missing.
+
+## License
+
+[MIT](LICENSE) © 2026 malahmen.
