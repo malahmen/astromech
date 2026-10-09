@@ -781,7 +781,10 @@ _prune_scan() {
     [[ -n "$out" ]] || return 0
     printf '%s\n' "$out"
     n="$(wc -l <<<"$out" | tr -d ' ')"
-    warn "${n} local override(s) above; a repo-local value and remote.origin.prune both beat the global setting."
+    # Not "above": the override lines go to stdout and this to stderr, so a
+    # front-end that captures one and streams the other can show them in
+    # either order. The warning has to stand on its own.
+    warn "fetch.prune is overridden locally in ${n} place(s); a repo-local value and remote.origin.prune both beat the global setting."
 }
 
 cmd_prune() {
@@ -823,7 +826,10 @@ cmd_prune() {
                 else
                     info "Undo with: git config --global --unset fetch.prune"
                 fi
-                _prune_explain
+                # No explanation here. 'prune' with no argument is the command
+                # that teaches; someone typing 'prune on' has already decided,
+                # and twelve lines of why is noise they did not ask for — and
+                # a duplicate when a front-end showed the state first.
             fi
             # Read back rather than echo the intent: what is reported is what
             # the config now says, which in a dry run is the unchanged value.
