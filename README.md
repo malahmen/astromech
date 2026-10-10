@@ -1,5 +1,7 @@
 # astromech
 
+[![ci](https://github.com/malahmen/astromech/actions/workflows/ci.yml/badge.svg)](https://github.com/malahmen/astromech/actions/workflows/ci.yml)
+
 > "Beep boop." — routine maintenance, every repo, one command.
 
 A gum-free, flag-driven bash CLI that keeps every git repository under a set of
@@ -27,8 +29,15 @@ These repos are **skipped and reported**, never touched:
 ## Tidy
 
 `tidy` is the other half: it deletes local branches whose work the trunk
-already holds — the ones left behind after a PR is merged and the forge deletes
-its own copy.
+already holds — the ones left behind after a PR is merged.
+
+Note that `tidy` only ever touches **local** branches. Whether the branch on
+the forge goes too is a per-repository setting there ("Automatically delete
+head branches" on GitHub), it is **off by default**, and nothing in git or in
+astromech turns it on. If it is off, merged branches pile up on the remote
+while your local clone looks clean — and `git branch -r` goes on listing them,
+because they really are still there. `fetch.prune` does not help: there is
+nothing stale to prune.
 
 Git has **no configuration that does this**, and the settings people reach
 for are not it:
@@ -36,7 +45,7 @@ for are not it:
 | Setting | What it actually prunes |
 | --- | --- |
 | `fetch.prune` (see [`prune`](#prune) below) | stale `origin/*` **remote-tracking refs** on fetch |
-| A forge's *delete branch on merge* | the branch **on the forge** |
+| A forge's *delete branch on merge* | the branch **on the forge** — off by default, and per repository |
 | — | nothing deletes merged **local** branches; that needs a command |
 
 So `tidy` prints every branch it would delete, with the repo and the short sha,
@@ -253,6 +262,34 @@ set, so an HTTPS remote that needs credentials fails instead of hanging the run.
 tests/run-all.sh      # file:// bare remotes, no network
 ```
 
+### CI
+
+[`.github/workflows/ci.yml`](.github/workflows/ci.yml) runs `shellcheck -S
+warning` over `astromech.sh` and `tests/*.sh`, then the whole suite, on every
+push to `main`, every pull request, and on demand. No secrets, no services:
+the suites work in temporary directories against `file://` remotes.
+
+The shellcheck step globs `tests/*.sh` deliberately. A named file list quietly
+stops covering the next test file somebody adds, which is the kind of gap you
+only find by not finding anything.
+
+The versions step prints `bash`, `git`, `shellcheck`, `setsid` and whether
+python's `pty` imports — because a suite that behaves differently on the runner
+than on a workstation is the hardest kind to debug from a log, and two of those
+are what the skip conditions below depend on.
+
+### Suites
+
+| File | Checks | What it covers |
+| --- | ---: | --- |
+| `test-tidy.sh` | 69 | the plan, the gate, `git branch -d` never `-D`, and that `status` lists exactly what `tidy` would delete |
+| `test-prune.sh` | 47 | the `fetch.prune` toggle, its read-back, and the overrides that beat it |
+| `test-local.sh` | 41 | maintenance per repo state: commit, stash, pull, and what is skipped |
+| `test-locked.sh` | 11 | the run lock, including a stale one whose holder is gone |
+| `test-default-branch.sh` | 10 | which branch is the trunk, in the orders that matter |
+
+**178 checks** in total.
+
 `test-prune.sh` writes to a global git config, so it first proves git honours
 `$GIT_CONFIG_GLOBAL` (2.32+) and skips itself if not — the real `~/.gitconfig`
 is not an acceptable place to find that out.
@@ -260,3 +297,7 @@ is not an acceptable place to find that out.
 `test-tidy.sh` needs `setsid` to observe the confirmation gate refusing with no
 controlling terminal, and python's `pty` to answer the question with one. It
 skips those checks, rather than failing, where either is missing.
+
+## License
+
+[MIT](LICENSE) © 2026 malahmen.
