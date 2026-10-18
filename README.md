@@ -15,6 +15,10 @@ walks every repo below the roots and, per repo:
 | On main/master with local changes | `git stash push -u` — the stash is **left for you** (never popped) |
 | Then, always | `git pull --rebase` |
 
+Every run that finds the trunk dirty adds a stash, so under cron they pile up.
+The summary lists each repo still holding astromech stashes, with the count,
+and `status` shows it beside the branch (`[main, 2 stashed]`).
+
 **Nothing is pushed.** If a step fails, astromech reports it, leaves the repo
 the way that step left it, and goes on to the next repo. A rebase that hits a
 conflict stays stopped, so whoever ran maintenance can resolve it
@@ -197,7 +201,8 @@ astromech.sh add-root ~/code ~/work          # folders holding git repos
 astromech.sh children ~/code                 # top-level folders (name<TAB>ignored)
 astromech.sh set-ignores ~/code archive tmp  # replace ~/code's ignored folders
 astromech.sh set-ignores ~/code              # …or clear them
-astromech.sh status                          # tree: repos [branch *dirty] + ignored
+astromech.sh set-ignores -- ~/code -scratch  # a name starting with - goes after --
+astromech.sh status                          # tree: repos [branch *dirty, N stashed] + ignored
 astromech.sh maintain --dry-run              # what would happen
 astromech.sh maintain                        # do it
 astromech.sh maintain --repo ~/code/api      # just one repo
@@ -284,11 +289,12 @@ are what the skip conditions below depend on.
 | --- | ---: | --- |
 | `test-tidy.sh` | 69 | the plan, the gate, `git branch -d` never `-D`, and that `status` lists exactly what `tidy` would delete |
 | `test-prune.sh` | 47 | the `fetch.prune` toggle, its read-back, and the overrides that beat it |
-| `test-local.sh` | 41 | maintenance per repo state: commit, stash, pull, and what is skipped |
+| `test-local.sh` | 51 | maintenance per repo state: commit, stash, pull, what is skipped, stash counts, and nested roots' ignores |
+| `test-failures.sh` | 18 | a hook refusing the wip commit, main and master together, a file named like the trunk, tidy meeting a run in progress |
 | `test-locked.sh` | 11 | the run lock, including a stale one whose holder is gone |
 | `test-default-branch.sh` | 10 | which branch is the trunk, in the orders that matter |
 
-**178 checks** in total.
+**206 checks** in total.
 
 `test-prune.sh` writes to a global git config, so it first proves git honours
 `$GIT_CONFIG_GLOBAL` (2.32+) and skips itself if not — the real `~/.gitconfig`
