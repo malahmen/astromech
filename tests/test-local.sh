@@ -125,6 +125,16 @@ Arun maintain
 check "in-progress rebase skipped"          said "conflict: rebase in progress"
 check "clean main is a plain pull"          bash -c "grep -A3 '── feat-repo' '$T/last.out' | grep -q '\[ok\].*pulled' && ! grep -A3 '── feat-repo' '$T/last.out' | grep -qE 'committed|stashed'"
 
+echo "## 6b. stashes left on the trunk are counted, not lost from view"
+check "the summary lists the kept stash"    said "stashes .*dirty-main: 1 kept"
+echo again > "$R1/dirty-main/f"
+Arun maintain --repo "$R1/dirty-main"
+check "a second dirty run makes it two"     said "stashes .*dirty-main: 2 kept"
+bash "$AM" status > "$T/status.out" 2>/dev/null
+check "status shows the count"              grep -q "dirty-main .*\[main, 2 stashed\]" "$T/status.out"
+check "  and explains it"                   grep -q "N stashed" "$T/status.out"
+check "a repo with none shows no count"     bash -c "! grep -q 'feat-repo .*stashed' '$T/status.out'"
+
 echo "## 7. --repo limits the run"
 Arun maintain --repo "$R1/legacy"
 check "only one repo maintained"            said "Maintaining 1 repo"
@@ -135,6 +145,20 @@ A remove-root "$R1"
 check "root removed"                        [ "$(bash "$AM" roots)" = "$R2" ]
 check "its ignores removed"                 [ -z "$(bash "$AM" ignores)" ]
 check "onboarded kept"                      bash -c "bash '$AM' config | grep -qx onboarded=1"
+
+echo "## 9. nested roots keep their own ignores"
+N="$T/nest"; mkdir -p "$N/old" "$N/inner/tmp" "$N/inner/keep"
+A add-root "$N" "$N/inner"
+A set-ignores "$N/inner" tmp
+A set-ignores "$N" old
+check "setting the outer root keeps the inner's"   bash -c "bash '$AM' ignores | grep -qx '$N/inner/tmp'"
+bash "$AM" status > "$T/status.out" 2>/dev/null
+check "status lists each ignore once, under its own root" [ "$(grep -c 'tmp/  (ignored)' "$T/status.out")" = 1 ]
+A set-ignores "$N"
+check "clearing the outer root keeps the inner's"  bash -c "bash '$AM' ignores | grep -qx '$N/inner/tmp'"
+check "  and does clear its own"                   bash -c "! bash '$AM' ignores | grep -qx '$N/old'"
+A remove-root "$N"
+check "removing the outer root keeps the inner's"  bash -c "bash '$AM' ignores | grep -qx '$N/inner/tmp'"
 
 echo
 if (( FAILS )); then echo "${FAILS} check(s) FAILED"; exit 1; fi

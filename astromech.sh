@@ -54,7 +54,7 @@ set -euo pipefail
 shopt -s nullglob
 
 SCRIPT_NAME="astromech"
-VERSION="1.1.0"
+VERSION="1.2.0"
 
 # ---- gum-free status output (stderr; stdout stays clean for data) ------------
 _ts() { date -u +%Y-%m-%dT%H:%M:%SZ; }
@@ -231,6 +231,12 @@ _resolve_root() {
     return 1
 }
 
+# _ignore_in IGNORE ROOT — the ignore is one of ROOT's own top-level folders.
+# By parent, not by prefix: with ~/code and ~/code/work both configured, a
+# prefix test reads ~/code/work/tmp as ~/code's too, and clearing or removing
+# ~/code then silently drops ~/code/work's ignores.
+_ignore_in() { [[ "${1%/*}" == "$2" ]]; }
+
 _is_ignored() {
     local i
     for i in "${IGNORES[@]}"; do [[ "$i" == "$1" ]] && return 0; done
@@ -289,6 +295,11 @@ _git() {
 }
 
 _is_dirty() { [[ -n "$(git -C "$1" status --porcelain 2>/dev/null)" ]]; }
+
+# _stashes REPO — how many of astromech's own stashes the repo holds. Each run
+# that finds the trunk dirty adds one and none is ever popped, so under cron
+# they pile up unless something says so.
+_stashes() { git -C "$1" stash list --format=%gs 2>/dev/null | grep -c 'astromech: before pull' || true; }
 
 _current_branch() { git -C "$1" symbolic-ref --short -q HEAD 2>/dev/null; }
 
@@ -405,7 +416,10 @@ maintain_repo() {
         if (( DRY_RUN )); then
             info "would check out '${def}'"
         else
-            _git "$repo" checkout -q "$def" || { _fail "checkout '${def}' failed (still on '${branch}')"; return; }
+            # '--': a tracked file named like the trunk makes a bare
+            # 'checkout main' ambiguous whenever main exists only on origin,
+            # and git then refuses it on every run.
+            _git "$repo" checkout -q "$def" -- || { _fail "checkout '${def}' failed (still on '${branch}')"; return; }
             info "checked out '${def}' (was '${branch}')"
         fi
         notes+=("${branch} → ${def}")
@@ -513,7 +527,7 @@ cmd_maintain() {
     fi
     info "Maintaining ${#targets[@]} repo(s)…"
 
-    local n_ok=0 n_skip=0 n_fail=0 rel lines=()
+    local n_ok=0 n_skip=0 n_fail=0 rel lines=() stashed=() ns
     for i in "${targets[@]}"; do
         rel="${REPO_LIST[$i]#"${REPO_ROOT[$i]}"/}"
         [[ "${REPO_LIST[$i]}" == "${REPO_ROOT[$i]}" ]] && rel="."
@@ -536,13 +550,16 @@ cmd_maintain() {
             skipped) n_skip=$((n_skip + 1));  lines+=("skipped  ${REPO_LIST[$i]/#$HOME/\~}: ${R_NOTE}") ;;
             failed)  n_fail=$((n_fail + 1));  lines+=("FAILED   ${REPO_LIST[$i]/#$HOME/\~}: ${R_NOTE}") ;;
         esac
+        ns="$(_stashes "${REPO_LIST[$i]}")"
+        (( ns )) && stashed+=("stashes  ${REPO_LIST[$i]/#$HOME/\~}: ${ns} kept (git -C ${REPO_LIST[$i]/#$HOME/\~} stash list)")
     done
 
     printf '\n' >&2
     info "Summary: ${n_ok} ok, ${n_skip} skipped, ${n_fail} failed."
     if (( TIDY )); then info "Tidy: ${TIDY_DELETED} branch(es) deleted, ${TIDY_FAILED} refused."; fi
     local l
-    for l in "${lines[@]}" "${TIDY_LINES[@]}"; do printf '          %s\n' "$l" >&2; done
+    (( ${#stashed[@]} )) && info "Stashes: ${#stashed[@]} repo(s) hold changes astromech stashed and nobody has picked up."
+    for l in "${lines[@]}" "${TIDY_LINES[@]}" "${stashed[@]}"; do printf '          %s\n' "$l" >&2; done
     (( n_fail == 0 && TIDY_FAILED == 0 ))
 }
 
@@ -879,7 +896,7 @@ cmd_remove_root() {
         root="$(_resolve_root "$p")" || error_exit "remove-root: not a configured root: ${p}"
         keep_r=(); keep_i=()
         for r in "${ROOTS[@]}";   do [[ "$r" == "$root" ]] || keep_r+=("$r"); done
-        for i in "${IGNORES[@]}"; do [[ "$i" == "${root}/"* ]] || keep_i+=("$i"); done
+        for i in "${IGNORES[@]}"; do _ignore_in "$i" "$root" || keep_i+=("$i"); done
         ROOTS=("${keep_r[@]}"); IGNORES=("${keep_i[@]}")
         success "root removed: ${root}"
     done
@@ -912,7 +929,7 @@ cmd_set_ignores() {
             || error_exit "set-ignores: '${name}' must be a top-level folder name under the root (no '/')."
         [[ -d "${root}/${name}" ]] || error_exit "set-ignores: no such folder: ${root}/${name}"
     done
-    for i in "${IGNORES[@]}"; do [[ "$i" == "${root}/"* ]] || keep+=("$i"); done
+    for i in "${IGNORES[@]}"; do _ignore_in "$i" "$root" || keep+=("$i"); done
     IGNORES=("${keep[@]}")
     for name in "$@"; do _is_ignored "${root}/${name}" || IGNORES+=("${root}/${name}"); done
     save_config
@@ -948,7 +965,7 @@ cmd_status() {
     load_config
     (( ${#ROOTS[@]} )) || { echo "(no roots configured)"; return 0; }
     discover
-    local root i entries=() kids=() rel br n k last cont line idx
+    local root i entries=() kids=() rel br n k last cont line idx ns any_stash=0
     local total=0 repos_with=0 any_local_base=0
     for root in "${ROOTS[@]}"; do
         printf '%s\n' "${root/#$HOME/\~}"
@@ -959,6 +976,8 @@ cmd_status() {
             rel="${REPO_LIST[$i]#"${root}"/}"; [[ "${REPO_LIST[$i]}" == "$root" ]] && rel="."
             br="$(_current_branch "${REPO_LIST[$i]}")" || br="(detached)"
             _is_dirty "${REPO_LIST[$i]}" && br+=" *"
+            ns="$(_stashes "${REPO_LIST[$i]}")"
+            (( ns )) && { br+=", ${ns} stashed"; any_stash=1; }
             entries+=("$(printf '%-40s %s' "$rel" "[${br}]")")
             idx=$(( ${#entries[@]} - 1 ))
 
@@ -986,7 +1005,7 @@ cmd_status() {
             fi
         done
         for i in "${IGNORES[@]}"; do
-            [[ "$i" == "${root}/"* ]] && entries+=("${i#"${root}"/}/  (ignored)")
+            _ignore_in "$i" "$root" && entries+=("${i#"${root}"/}/  (ignored)")
         done
         n=${#entries[@]}
         (( n )) || { echo "└── (no repositories found)"; echo; continue; }
@@ -1002,6 +1021,7 @@ cmd_status() {
         echo
     done
     echo "[branch *] = uncommitted changes"
+    (( any_stash )) && echo "[branch, N stashed] = N changes astromech stashed and nobody has picked up (git stash list)"
     if (( total )); then
         printf -- '- branch   = already contained in the trunk on origin; %s.sh tidy deletes these\n' "$SCRIPT_NAME"
         (( any_local_base )) && printf -- '             (where a repo has no origin, against its local trunk instead)\n'
