@@ -67,6 +67,8 @@ upstream "$R/c-named" main n upstream-n
 
 bash "$AM" add-root "$R" >/dev/null 2>&1; bash "$AM" mark-onboarded >/dev/null
 Arun maintain; rc=$?
+# Section 2 runs maintain again and overwrites last.out: section 3 reads this.
+cp "$T/last.out" "$T/first.out"
 
 echo "## 1. a hook refuses the wip commit"
 check "exits 1: a repo failed"                  [ "$rc" -eq 1 ]
@@ -92,7 +94,7 @@ check "from a feature branch, origin's master, not main" [ "$(br "$R/b-both")" =
 echo "## 3. a tracked file named like the trunk"
 check "checked out main, not refused"           [ "$(br "$R/c-named")" = main ]
 check "and pulled it"                           [ -f "$R/c-named/n" ]
-check "the summary does not list it"            bash -c "! grep -q 'c-named' <(grep -E 'FAILED|skipped' '$T/last.out')"
+check "the first run's summary does not list it" bash -c "grep -q 'c-named' '$T/first.out' && ! grep -q 'c-named' <(grep -E 'FAILED|skipped' '$T/first.out')"
 
 echo "## 4. tidy waits for a run in progress"
 git -C "$R/c-named" branch -q done-branch main
