@@ -83,9 +83,14 @@ Two things make it safe rather than merely careful:
   leaves the branch alone — forcing it is the operator's decision, not a
   script's.
 
-Branches that are the trunk, checked out, or held by another worktree never
-appear in the list. Repos mid-rebase, on a detached HEAD, or with no trunk are
-reported and left alone.
+Branches that are the trunk, checked out, or held by another worktree (being
+rebased or bisected there included) never appear in the list - and neither do
+the long-lived names `main`, `master`, `develop`, `development`, `trunk`,
+`stable`, `release/*` and `hotfix/*`, whatever `origin/HEAD` names as the trunk
+(in a git-flow repo a `main` behind `develop` is "merged", and is still not
+tidied). Repos mid-rebase, on a detached HEAD, or with no trunk are reported and
+left alone. A linked worktree (`git worktree add`) under a root is part of its
+repository, not a second one.
 
 `status` shows the same branches under each repo, so you can see what has piled
 up without being asked to delete anything:
@@ -192,7 +197,8 @@ from cron or a systemd timer.
 
 ## Requirements
 
-bash ≥ 4 (on macOS: `brew install bash`) and git ≥ 2.13. Nothing else.
+bash ≥ 4 (on macOS: `brew install bash`) and git ≥ 2.23 (for `tidy`'s view of
+which branches are checked out; checked at start). Nothing else.
 
 ## Usage
 

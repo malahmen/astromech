@@ -213,6 +213,9 @@ if (( HAVE_SETSID )); then
     check "no terminal and no --yes: refuses"     test "$RC" -ne 0
     check "  before maintaining anything"         bash -c '! git -C "$BEHIND2" merge-base --is-ancestor later main'
     check "  and points at tidy --dry-run"        has "tidy --dry-run" "$ERR"
+else
+    # Said, not silent: a missing check reads as a passing one (Kamino item 142).
+    echo "   SKIP - no setsid here: the no-terminal refusal of maintain --tidy is not checked"
 fi
 later_sha="$(git -C "$R/behind2" rev-parse later)"
 run maintain --repo "$R/behind2" --tidy --yes

@@ -38,7 +38,9 @@
 # in a separate front-end (scomp-link) that drives this engine with flags —
 # the holo-convert / holonet-sync pattern.
 #
-# Requirements: bash >= 4, git >= 2.13. Run --help for the command list.
+# Requirements: bash >= 4, git >= 2.23 (for-each-ref's %(worktreepath), which
+# tidy relies on to leave checked-out branches alone; checked at start). Run
+# --help for the command list.
 #
 # Config: ~/.config/astromech/astromech.conf   (one key=value per line)
 # -----------------------------------------------------------------------------
@@ -261,18 +263,57 @@ _walk() {
     done
 }
 
-# Fills REPO_LIST / REPO_ROOT (parallel arrays), deduplicated across roots.
+# The repository's shared git directory, absolute: one per repository, the
+# same for every worktree of it.
+_common_dir() {
+    local c
+    c="$(git -C "$1" rev-parse --git-common-dir 2>/dev/null)" || return 1
+    (cd "$1" && cd "$c" && pwd -P)
+}
+
+# A linked worktree (`git worktree add`) has a git dir of its own under the
+# shared one; a submodule, whose .git is also a file, does not.
+_is_linked_worktree() {
+    local gd cd
+    gd="$(git -C "$1" rev-parse --absolute-git-dir 2>/dev/null)" || return 1
+    cd="$(_common_dir "$1")" || return 1
+    [[ "$(cd "$gd" && pwd -P)" != "$cd" ]]
+}
+
+# The deepest configured root holding REPO: with nested roots, status listed a
+# repo under whichever root was walked first (Kamino item 142).
+_deepest_root() {
+    local repo="$1" r best=""
+    for r in "${ROOTS[@]}"; do
+        if [[ "$repo" == "$r" || "$repo" == "$r"/* ]] && (( ${#r} > ${#best} )); then best="$r"; fi
+    done
+    printf '%s' "$best"
+}
+
+# Fills REPO_LIST / REPO_ROOT (parallel arrays), one entry per repository.
+#
+# A linked worktree is part of its repository, not a second one: discovered as
+# one, status listed its branch twice, tidy deleted it from one side and then
+# reported git's refusal on the other - every cron --tidy run failed and
+# suggested -D - and maintain would have wip-committed on it (Kamino item
+# 141). So they are skipped, and repositories are told apart by their shared
+# git dir rather than by path.
 REPO_LIST=(); REPO_ROOT=()
 discover() {
     REPO_LIST=(); REPO_ROOT=()
     local -A seen=()
-    local root repo
+    local root repo key
     for root in "${ROOTS[@]}"; do
         if [[ ! -d "$root" ]]; then warn "root not found (skipped): ${root}"; continue; fi
         while IFS= read -r repo; do
-            [[ -n "${seen[$repo]:-}" ]] && continue
-            seen[$repo]=1
-            REPO_LIST+=("$repo"); REPO_ROOT+=("$root")
+            if _is_linked_worktree "$repo"; then
+                dbg "linked worktree, part of $(_common_dir "$repo"): ${repo}"
+                continue
+            fi
+            key="$(_common_dir "$repo" || printf '%s' "$repo")"
+            [[ -n "${seen[$key]:-}" ]] && continue
+            seen[$key]=1
+            REPO_LIST+=("$repo"); REPO_ROOT+=("$(_deepest_root "$repo")")
         done < <(_walk "$root" 0)
     done
 }
@@ -583,6 +624,42 @@ cmd_maintain() {
 #   - deletion is `git branch -d`, never -D. The plan is this script's opinion;
 #     -d is git's own, and a branch has to satisfy both.
 
+# Branch names tidy never plans, whatever they contain (Kamino item 140). Only
+# the detected trunk was excluded, so in a git-flow repository (origin/HEAD ->
+# develop) a local main behind develop counted as merged and `tidy --yes`
+# deleted it, its upstream setting with it; release/* or stable likewise.
+# Long-lived by convention, and the README promises trunks never appear.
+TIDY_KEEP=(main master develop development trunk stable 'release/*' 'hotfix/*')
+_tidy_keep() {
+    local p
+    for p in "${TIDY_KEEP[@]}"; do
+        # shellcheck disable=SC2053
+        [[ "$1" == $p ]] && return 0
+    done
+    return 1
+}
+
+# _busy_branches REPO - every branch some worktree of REPO is using: checked
+# out, or being rebased or bisected (git then shows the worktree as detached,
+# so %(worktreepath) is empty for the branch and git refuses to delete it -
+# a spurious REFUSED with -D advice; Kamino item 142).
+_busy_branches() {
+    local repo="$1" line wt gd f
+    while IFS= read -r line; do
+        case "$line" in
+            "branch refs/heads/"*) printf '%s\n' "${line#branch refs/heads/}" ;;
+            "worktree "*)
+                wt="${line#worktree }"
+                gd="$(git -C "$wt" rev-parse --absolute-git-dir 2>/dev/null)" || continue
+                for f in rebase-merge/head-name rebase-apply/head-name; do
+                    [[ -f "${gd}/${f}" ]] && sed 's#^refs/heads/##' "${gd}/${f}"
+                done
+                [[ -f "${gd}/BISECT_START" ]] && head -1 "${gd}/BISECT_START"
+                ;;
+        esac
+    done < <(git -C "$repo" worktree list --porcelain 2>/dev/null)
+}
+
 TIDY_PLAN=()        # "<repo>\t<branch>\t<base>", in discovery order
 TIDY_NOTES=()       # repos that could not be planned, and why
 TIDY_DELETED=0; TIDY_FAILED=0; TIDY_LINES=()
@@ -597,6 +674,8 @@ _tidy_plan_repo() {
     fi
     op="$(_in_progress "$repo")"
     [[ -n "$op" ]] && { TIDY_NOTES+=("${repo}: ${op} in progress — left alone"); return 0; }
+    # As the README says, and as maintain does (Kamino item 142).
+    _current_branch "$repo" >/dev/null || { TIDY_NOTES+=("${repo}: detached HEAD — left alone"); return 0; }
     trunk="$(_default_branch "$repo")" || { TIDY_NOTES+=("${repo}: no main or master branch"); return 0; }
 
     if git -C "$repo" show-ref --verify -q "refs/remotes/origin/${trunk}"; then
@@ -610,9 +689,14 @@ _tidy_plan_repo() {
         TIDY_NOTES+=("${repo}: '${trunk}' exists neither locally nor on origin"); return 0
     fi
 
+    local -A busy=()
+    while IFS= read -r b; do [[ -n "$b" ]] && busy[$b]=1; done < <(_busy_branches "$repo")
+
     while IFS=$'\t' read -r b wt; do
         [[ -n "$b" ]] || continue
         [[ "$b" == "$trunk" ]] && continue
+        _tidy_keep "$b" && continue
+        [[ -n "${busy[$b]:-}" ]] && continue
         # A branch checked out anywhere — here or in another worktree — has a
         # worktreepath, and git refuses to delete it. It must not appear in a
         # list that says it will be deleted.
@@ -620,7 +704,9 @@ _tidy_plan_repo() {
         git -C "$repo" merge-base --is-ancestor "refs/heads/${b}" "$base" 2>/dev/null || continue
         TIDY_PLAN+=("${repo}"$'\t'"${b}"$'\t'"${base}")
         n=$(( n + 1 ))
-    done < <(git -C "$repo" for-each-ref --format=$'%(refname:short)\t%(worktreepath)' refs/heads/ 2>/dev/null)
+    # lstrip=2, not :short - a branch sharing its name with a tag comes out of
+    # :short as heads/<name>, and dropped out of the plan (Kamino item 142).
+    done < <(git -C "$repo" for-each-ref --format=$'%(refname:lstrip=2)\t%(worktreepath)' refs/heads/ 2>/dev/null)
     dbg "${repo}: ${n} branch(es) contained in ${base}"
 }
 
@@ -711,8 +797,11 @@ cmd_tidy() {
 
     # Nothing is fetched here, on purpose: tidy must not reach the network to
     # decide what to delete. It therefore measures against whatever origin/
-    # trunk was last fetched, which can only make it see FEWER branches as
-    # merged, never more. 'maintain --tidy' pulls first and so sees all of them.
+    # trunk was last fetched, which usually means FEWER branches seen as
+    # merged - but not always: after the trunk was force-pushed, the last
+    # fetched origin/trunk may hold commits the remote no longer has (Kamino
+    # item 142). 'maintain --tidy' pulls first and measures against the
+    # current one.
     TIDY_PLAN=(); TIDY_NOTES=()
     local i
     for i in "${TARGETS[@]}"; do _tidy_plan_repo "${REPO_LIST[$i]}"; done
@@ -763,7 +852,9 @@ cmd_tidy() {
 # longer has, which is a far bigger promise than dropping a stale branch ref,
 # and nothing in astromech needs it.
 
-_prune_global() { git config --global --get fetch.prune 2>/dev/null || true; }
+# --includes: a value set in a file the global config includes is the one git
+# uses, and was reported as unset (Kamino item 142).
+_prune_global() { git config --global --includes --get fetch.prune 2>/dev/null || true; }
 _prune_true()   { case "${1,,}" in true|yes|on|1) return 0 ;; *) return 1 ;; esac; }
 
 # The explanation goes to stderr so the key=value report on stdout stays
@@ -862,7 +953,8 @@ cmd_prune() {
             fi
             # Read back rather than echo the intent: what is reported is what
             # the config now says, which in a dry run is the unchanged value.
-            printf 'fetch.prune=%s\n' "$(_prune_global || true)"
+            cur="$(_prune_global || true)"
+            printf 'fetch.prune=%s\n' "${cur:-unset}"
             _prune_scan
             ;;
         *)  error_exit "prune: expected 'on', 'off', or nothing (to show the current state); got '${want}'." ;;
@@ -962,6 +1054,9 @@ cmd_mark_onboarded() { load_config; ONBOARDED=1; save_config; }
 # promising a deletion tidy then refuses (or hiding one it would make) is worse
 # than not showing them at all.
 cmd_status() {
+    # Read-only: no optional locks, so status cannot fail a concurrent cron
+    # maintain on index.lock (Kamino item 142).
+    export GIT_OPTIONAL_LOCKS=0
     load_config
     (( ${#ROOTS[@]} )) || { echo "(no roots configured)"; return 0; }
     discover
@@ -974,7 +1069,10 @@ cmd_status() {
         for i in "${!REPO_LIST[@]}"; do
             [[ "${REPO_ROOT[$i]}" == "$root" ]] || continue
             rel="${REPO_LIST[$i]#"${root}"/}"; [[ "${REPO_LIST[$i]}" == "$root" ]] && rel="."
-            br="$(_current_branch "${REPO_LIST[$i]}")" || br="(detached)"
+            br="$(_current_branch "${REPO_LIST[$i]}")" || {
+                # A rebase detaches HEAD; say which (Kamino item 142).
+                br="$(_in_progress "${REPO_LIST[$i]}")"; br="(${br:-detached})"
+            }
             _is_dirty "${REPO_LIST[$i]}" && br+=" *"
             ns="$(_stashes "${REPO_LIST[$i]}")"
             (( ns )) && { br+=", ${ns} stashed"; any_stash=1; }
@@ -1030,6 +1128,16 @@ cmd_status() {
 }
 
 # -----------------------------------------------------------------------------
+# %(worktreepath) arrived in git 2.23; older ones print an empty field, and
+# tidy would then plan checked-out branches without a word (Kamino item 142).
+_require_git() {
+    local v maj min
+    v="$(git version 2>/dev/null | awk '{print $3}')"
+    maj="${v%%.*}"; min="${v#*.}"; min="${min%%.*}"
+    [[ "$maj" =~ ^[0-9]+$ && "$min" =~ ^[0-9]+$ ]] || return 0
+    (( maj > 2 || (maj == 2 && min >= 23) )) || error_exit "git ${v} is too old: ${SCRIPT_NAME} needs 2.23 or newer."
+}
+
 main() {
     local cmd="${1:-}" args=()
     [[ $# -gt 0 ]] && shift
@@ -1050,6 +1158,7 @@ main() {
         esac
     done
 
+    case "$cmd" in maintain|tidy|status|repos|prune) _require_git ;; esac
     case "$cmd" in
         maintain)       cmd_maintain ;;
         tidy)           cmd_tidy ;;
