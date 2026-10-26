@@ -302,16 +302,25 @@ _deepest_root() {
 # suggested -D - and maintain would have wip-committed on it (Kamino item
 # 141). So they are skipped, and repositories are told apart by their shared
 # git dir rather than by path.
+#
+# A linked worktree whose repository was NOT found under any root is the
+# exception that must not vanish without a word (Kamino item 193): it is
+# named, with the reason, on every run. It is still not maintained - its trunk
+# is checked out in the primary worktree, so the checkout would fail, and a
+# wip commit on its branch is exactly what item 141 removed. Covering it means
+# adding the repository's own folder as a root.
 REPO_LIST=(); REPO_ROOT=()
 discover() {
     REPO_LIST=(); REPO_ROOT=()
-    local -A seen=()
+    local -A seen=() orphans=()
     local root repo key
     for root in "${ROOTS[@]}"; do
         if [[ ! -d "$root" ]]; then warn "root not found (skipped): ${root}"; continue; fi
         while IFS= read -r repo; do
             if _is_linked_worktree "$repo"; then
-                dbg "linked worktree, part of $(_common_dir "$repo"): ${repo}"
+                key="$(_common_dir "$repo")"
+                dbg "linked worktree, part of ${key}: ${repo}"
+                orphans[$repo]="$key"
                 continue
             fi
             key="$(_common_dir "$repo" || printf '%s' "$repo")"
@@ -319,6 +328,13 @@ discover() {
             seen[$key]=1
             REPO_LIST+=("$repo"); REPO_ROOT+=("$(_deepest_root "$repo")")
         done < <(_walk "$root" 0)
+    done
+    local primary
+    for repo in "${!orphans[@]}"; do
+        key="${orphans[$repo]}"
+        [[ -n "${seen[$key]:-}" ]] && continue
+        primary="$key"; [[ "$primary" == */.git ]] && primary="${primary%/.git}"
+        warn "linked worktree not maintained: ${repo/#$HOME/\~} belongs to ${primary/#$HOME/\~}, which is under no root (or is ignored) - add that folder as a root to cover it"
     done
 }
 

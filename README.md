@@ -245,8 +245,13 @@ and tidy's plan print their data to stdout.
 
 ## Discovery
 
-Repos are found **recursively** below each root. Any folder containing `.git`
-counts, whether `.git` is a directory or a file (worktrees and submodules). The
+Repos are found **recursively** below each root. A folder containing `.git`
+counts, whether `.git` is a directory or a file (a submodule) — with one
+exception: a linked worktree (`git worktree add`), whose `.git` is also a file,
+is part of its repository and never counted as a repository of its own. When
+that repository is itself under no root (or is ignored), the worktree is not
+maintained, and every run names it in a warning rather than dropping it without
+a word; add the repository's folder as a root to cover it. The
 walk never goes inside a repo it has found, and it skips hidden folders,
 symlinks and ignored folders. It stops at `ASTROMECH_MAX_DEPTH` levels below the
 root (default 6). Ignores apply to a root's **top-level** folders, and an

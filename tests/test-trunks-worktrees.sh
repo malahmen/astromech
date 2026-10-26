@@ -122,7 +122,8 @@ check "a branch named like a tag is tidied"     gone "$R/tagged" v1
 check "...and the tag stays"                    git -C "$R/tagged" show-ref --verify -q refs/tags/v1
 run status
 check "status names a rebase, not just detached" has "(rebase)" "$OUT"
-check "status does not list the worktree twice" test "$(grep -c "wt" <<<"$OUT")" -le 1
+# Tree entries only: a bare "wt" also matched the root's own mktemp path.
+check "status does not list the worktree twice" test "$(grep -cE '^[├└]── wt(-linked)? ' <<<"$OUT")" -eq 1
 
 G="$T/gitconfig"; printf '[include]\n\tpath = %s/inc\n' "$T" > "$G"; printf '[fetch]\n\tprune = true\n' > "$T/inc"
 GIT_CONFIG_GLOBAL="$G" run prune
@@ -137,6 +138,55 @@ git -C "$R/nopull" remote set-url origin "$T/remotes/missing.git"
 run maintain --repo "$R/nopull" --tidy --yes
 check "a failed pull fails the run"             test "$RC" -ne 0
 check "...and tidies nothing"                   have "$R/nopull" shipped
+
+echo
+echo "== 193: what was untested, and a worktree that vanished =="
+# A linked worktree under the root whose repository is outside every root:
+# not maintained (its trunk is checked out elsewhere), but named, not dropped.
+mkdir -p "$T/elsewhere"; git init -q -b main "$T/elsewhere/primary"
+echo x > "$T/elsewhere/primary/f"; git -C "$T/elsewhere/primary" add f; git -C "$T/elsewhere/primary" commit -qm x
+git -C "$T/elsewhere/primary" worktree add -q -b side "$R/stray-wt"
+run repos
+check "a stray worktree is still not a repo of its own" lacks "stray-wt" "$OUT"
+check "...but it is named, not silently dropped"  has "stray-wt" "$ERR"
+check "...with the repository it belongs to"      has "elsewhere/primary" "$ERR"
+check "a worktree whose repo IS found is not warned about" lacks "wt-linked" "$ERR"
+
+# BISECT_START: a merged branch being bisected in another worktree (which git
+# shows as detached) is left alone by tidy.
+mk bis; br "$R/bis" bisecting; mergeto "$R/bis" bisecting
+git -C "$R/bis" worktree add -q "$T/bis-wt" bisecting
+gd="$(git -C "$T/bis-wt" rev-parse --absolute-git-dir)"; git -C "$T/bis-wt" checkout -q --detach
+echo bisecting > "$gd/BISECT_START"
+run tidy --dry-run --repo "$R/bis"
+check "a branch being bisected elsewhere is not planned" lacks "bisecting" "$OUT"
+run tidy --yes --repo "$R/bis"
+check "...nor deleted"                            have "$R/bis" bisecting
+check "...nor refused"                            lacks "REFUSED" "$ERR"
+
+# Deepest root: with nested roots, a repo under the inner one is the inner
+# one's, whichever root is walked first.
+git init -q --bare -b main "$T/remotes/nested.git"
+git clone -q "$T/remotes/nested.git" "$T/outer/inner/nested" 2>/dev/null
+echo n > "$T/outer/inner/nested/f"; git -C "$T/outer/inner/nested" add f
+git -C "$T/outer/inner/nested" commit -qm n; git -C "$T/outer/inner/nested" push -q -u origin main 2>/dev/null
+bash "$AM" add-root "$T/outer" "$T/outer/inner" >/dev/null 2>&1
+run repos
+check "a repo under the inner root is listed once" test "$(grep -c "/inner/nested$" <<<"$OUT")" -eq 1
+check "...under the inner root"                    has "$T/outer/inner"$'\t'"$T/outer/inner/nested" "$OUT"
+run maintain --dry-run --repo "$T/outer/inner/nested"
+check "maintain heads it with the inner root"      has "nested  ($T/outer/inner)" "$ERR"
+bash "$AM" remove-root "$T/outer" "$T/outer/inner" >/dev/null 2>&1
+
+# GIT_OPTIONAL_LOCKS: status is read-only, so every git it runs must take no
+# optional lock (a refreshed index under a concurrent cron maintain).
+mkdir -p "$T/gitstub"; realgit="$(command -v git)"
+# Only calls inside a repository (-C): 'git --version' at start-up reads none.
+printf '#!/bin/sh\n[ "$1" = -C ] && printf "%%s\\n" "${GIT_OPTIONAL_LOCKS-unset}" >> "%s/optlocks"\nexec "%s" "$@"\n' "$T" "$realgit" > "$T/gitstub/git"
+chmod +x "$T/gitstub/git"; : > "$T/optlocks"
+PATH="$T/gitstub:$PATH" run status
+check "status ran git in the repos"       test -s "$T/optlocks"
+check "...always with GIT_OPTIONAL_LOCKS=0"       test -z "$(grep -vx 0 "$T/optlocks")"
 
 echo
 (( FAILS == 0 )) && echo "test-trunks-worktrees: all checks passed" || { echo "test-trunks-worktrees: ${FAILS} check(s) failed"; exit 1; }
