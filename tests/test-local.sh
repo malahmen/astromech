@@ -17,6 +17,9 @@ T="$(cd "$T" && pwd)"   # macOS: /var → /private/var, match what the engine st
 export ASTROMECH_CONFIG="$T/cfg/astromech.conf"
 export GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@t GIT_COMMITTER_NAME=t GIT_COMMITTER_EMAIL=t@t
 export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1   # no user hooks/signing/aliases
+# The run lock lives under $HOME (and TMPDIR is where older engines put it):
+# both inside $T, so no run here touches the user's real lock.
+export HOME="$T/home" TMPDIR="$T/tmp"; mkdir -p "$HOME" "$TMPDIR"; unset XDG_RUNTIME_DIR
 A() { bash "$AM" "$@" 2> >(sed 's/^[^ ]*Z //' >> "$T/err.log"); }
 Arun() { : > "$T/last.out"; bash "$AM" "$@" > "$T/last.out" 2>&1; }
 

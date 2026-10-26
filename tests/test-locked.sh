@@ -14,8 +14,9 @@ T="$(cd "$T" && pwd)"
 export ASTROMECH_CONFIG="$T/cfg/astromech.conf"
 export GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@t GIT_COMMITTER_NAME=t GIT_COMMITTER_EMAIL=t@t
 export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1
-# The run lock lives under here, so each test run gets its own.
-export XDG_RUNTIME_DIR="$T/run"; mkdir -p "$XDG_RUNTIME_DIR"
+# The run lock lives under $HOME (and TMPDIR is where older engines put it):
+# both inside $T, so no run here touches the user's real lock.
+export HOME="$T/home" TMPDIR="$T/tmp"; mkdir -p "$HOME" "$TMPDIR"; unset XDG_RUNTIME_DIR
 
 FAILS=0
 check() { local d="$1"; shift; if "$@"; then echo "   ok   - $d"; else echo "   FAIL - $d"; FAILS=$((FAILS + 1)); fi; }
@@ -65,20 +66,54 @@ check "the locked repo was not committed"    [ -n "$(git -C "$R/a-locked" status
 check "the next repo was still maintained"   [ -f "$R/b-normal/g" ]
 
 echo "## the run lock"
-LOCK="$XDG_RUNTIME_DIR/astromech-$(id -u).lock"
+LOCK="$HOME/.local/state/astromech/run.lock"
 # A holder that is alive: refuse.
 sleep 30 & holder=$!
-mkdir -p "$LOCK"; printf '%s\n' "$holder" > "$LOCK/pid"
+mkdir -p "${LOCK%/*}"; printf '%s\n' "$holder" > "$LOCK"
 out2="$(bash "$AM" maintain 2>&1)"; rc2=$?
 check "a live lock holder is respected"      [ "$rc2" -ne 0 ]
 check "  and says so"                        grep -qi "in progress" <<<"$out2"
 kill "$holder" 2>/dev/null; wait "$holder" 2>/dev/null
 # A holder that is gone: take it over rather than block maintenance forever.
-printf '%s\n' "$holder" > "$LOCK/pid"
+printf '%s\n' "$holder" > "$LOCK"
 out3="$(bash "$AM" maintain 2>&1)"
 check "a dead holder's lock is reclaimed"    grep -q "Summary:" <<<"$out3"
 check "  and it is reported"                 grep -qi "stale run lock" <<<"$out3"
 check "the lock is released afterwards"      [ ! -e "$LOCK" ]
+
+echo "## one lock per user, whatever the environment (Kamino item 193)"
+# cron sets no XDG_RUNTIME_DIR, a desktop session does: the two runs used to
+# take two different locks and exclude nothing.
+sleep 30 & holder=$!
+printf '%s\n' "$holder" > "$LOCK"
+out4="$(env -u XDG_RUNTIME_DIR bash "$AM" maintain 2>&1)"; rc4=$?
+check "a run without XDG_RUNTIME_DIR (cron) is refused"   [ "$rc4" -ne 0 ]
+check "  because of the lock"                             grep -q "in progress" <<<"$out4"
+mkdir -p "$T/xdg"
+out5="$(XDG_RUNTIME_DIR="$T/xdg" bash "$AM" maintain 2>&1)"; rc5=$?
+check "a run with XDG_RUNTIME_DIR (desktop) is refused"   [ "$rc5" -ne 0 ]
+check "  because of the lock"                             grep -q "in progress" <<<"$out5"
+kill "$holder" 2>/dev/null; wait "$holder" 2>/dev/null; rm -f "$LOCK"
+
+echo "## the lock never exists without its pid (Kamino item 193)"
+# A mkdir that, once, pauses for a second after doing its work: whatever the
+# engine creates with it, a lock that is visible before its pid is written
+# stays that way for the whole second, and a second run arriving then must not
+# read it as stale and remove it from under its holder.
+stub="$T/stub"; mkdir -p "$stub"; realmkdir="$(command -v mkdir)"
+cat > "$stub/mkdir" <<STUB
+#!/usr/bin/env bash
+"$realmkdir" "\$@"; rc=\$?
+case "\$*" in *"$T/"*) if rm "$T/pause-once" 2>/dev/null; then sleep 1; fi ;; esac
+exit \$rc
+STUB
+chmod +x "$stub/mkdir"; : > "$T/pause-once"
+PATH="$stub:$PATH" bash "$AM" maintain > "$T/a.out" 2>&1 & first=$!
+for _ in $(seq 50); do [ -e "$T/pause-once" ] || break; sleep 0.1; done
+PATH="$stub:$PATH" bash "$AM" maintain > "$T/b.out" 2>&1
+wait "$first"
+check "neither run calls the other's lock stale"          bash -c '! grep -qi "stale run lock" "$1" "$2"' _ "$T/a.out" "$T/b.out"
+check "no lock is left behind"                            [ ! -e "$LOCK" ]
 
 echo
 if (( FAILS )); then echo "${FAILS} check(s) failed"; exit 1; fi

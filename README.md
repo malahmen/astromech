@@ -273,6 +273,13 @@ ignore=/Users/me/code/archive
 Without a terminal, log lines get a UTC timestamp and `GIT_TERMINAL_PROMPT=0` is
 set, so an HTTPS remote that needs credentials fails instead of hanging the run.
 
+`maintain` and `tidy` take one run lock per user,
+`~/.local/state/astromech/run.lock`, so a cron run and one started by hand
+never interleave. The path depends on `$HOME` alone — not on
+`XDG_RUNTIME_DIR` or `XDG_STATE_HOME`, which a desktop session sets and cron
+does not. A lock whose holder is gone (killed, or from before a reboot) is
+reported and taken over.
+
 ## Tests
 
 ```bash

@@ -514,30 +514,77 @@ maintain_repo() {
 # the first place: one of them is holding it legitimately while the other
 # reports it as wreckage.
 #
-# A directory, not flock(1): mkdir is atomic everywhere and macOS ships no
-# flock. Under XDG_RUNTIME_DIR when there is one (per-user, tmpfs, cleared on
-# logout), else TMPDIR — which may be shared, hence the uid in the name.
-_LOCK_DIR=""
-_lock_path() { printf '%s/astromech-%s.lock' "${XDG_RUNTIME_DIR:-${TMPDIR:-/tmp}}" "$(id -u)"; }
+# One fixed path per user, under $HOME (Kamino item 193). It used to live under
+# XDG_RUNTIME_DIR when set, else TMPDIR: cron sets neither while a desktop
+# session sets the first, so the cron run and the interactive one each took a
+# lock of their own and excluded nothing. XDG_STATE_HOME is not honoured for
+# the same reason - it is set by a login profile and absent under cron. $HOME
+# is set in both.
+#
+# A file created by link(2), not flock(1) (macOS ships none) nor mkdir. The pid
+# is written to a temporary file first and that file is then linked into place,
+# which is atomic and fails if the lock exists: the lock never exists without
+# its pid. With mkdir-then-write, a second run arriving in between read an
+# empty pid, called the lock stale and removed it from under its live holder.
+#
+# The lock outlives a reboot (it is no longer on a tmpfs), so it records the
+# boot too: after a reboot its pid may belong to some unrelated new process,
+# which must not block maintenance forever.
+_LOCK_FILE=""
+_lock_path() { printf '%s/.local/state/astromech/run.lock' "$HOME"; }
 
-_run_lock() {
-    local d; d="$(_lock_path)"
-    if mkdir "$d" 2>/dev/null; then
-        printf '%s\n' "$$" > "${d}/pid"; _LOCK_DIR="$d"; return 0
-    fi
-    # Held — or abandoned. A holder that no longer exists must not block
-    # maintenance forever: that turns one killed run into a silent stop.
-    local pid; pid="$(cat "${d}/pid" 2>/dev/null || true)"
-    if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
-        return 1
-    fi
-    warn "removing a stale run lock (${d}; pid ${pid:-unknown} is gone)"
-    rm -rf "$d"
-    mkdir "$d" 2>/dev/null || return 1
-    printf '%s\n' "$$" > "${d}/pid"; _LOCK_DIR="$d"
+_boot_id() {
+    cat /proc/sys/kernel/random/boot_id 2>/dev/null \
+        || sysctl -n kern.boottime 2>/dev/null \
+        || true
 }
 
-_release_lock() { [[ -n "$_LOCK_DIR" ]] && rm -rf "$_LOCK_DIR"; _LOCK_DIR=""; }
+# _lock_take FILE — 0 when FILE was created holding this run's pid and boot.
+_lock_take() {
+    local f="$1" tmp rc=0
+    tmp="$(mktemp "${f%/*}/.run.lock.XXXXXX")" || return 1
+    printf '%s\n%s\n' "$$" "$(_boot_id)" > "$tmp" || rc=1
+    (( rc )) || ln "$tmp" "$f" 2>/dev/null || rc=1
+    rm -f "$tmp"
+    return "$rc"
+}
+
+_run_lock() {
+    local f pid="" boot=""; f="$(_lock_path)"
+    mkdir -p "${f%/*}" 2>/dev/null || { error "cannot create ${f%/*}"; return 1; }
+    # ln onto a directory would create a link inside it and "succeed".
+    [[ -d "$f" ]] && { error "${f} is a directory, not a lock file"; return 1; }
+    _lock_take "$f" && { _LOCK_FILE="$f"; return 0; }
+    # Held — or abandoned. A holder that no longer exists must not block
+    # maintenance forever: that turns one killed run into a silent stop.
+    local held old cur=""
+    held="$(cat "$f" 2>/dev/null)" || held=""
+    # Gone since (its holder finished): just try again. Present but empty
+    # cannot come from a live run any more, so it is stale like a dead pid.
+    if [[ -e "$f" ]]; then
+        { IFS= read -r pid; IFS= read -r boot; } <<< "$held"
+        if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null \
+            && { [[ -z "$boot" ]] || [[ "$boot" == "$(_boot_id)" ]] || [[ -z "$(_boot_id)" ]]; }; then
+            return 1
+        fi
+        # Moved aside, not removed, and checked: a second run that judged the
+        # same lock stale may already have replaced it with its own live one.
+        old="${f}.stale.$$"
+        mv -f "$f" "$old" 2>/dev/null || return 1
+        cur="$(cat "$old" 2>/dev/null)" || cur=""
+        if [[ "$cur" != "$held" ]]; then
+            ln "$old" "$f" 2>/dev/null || true
+            rm -f "$old"
+            return 1
+        fi
+        rm -f "$old"
+        warn "removing a stale run lock (${f}; pid ${pid:-unknown} is gone)"
+    fi
+    _lock_take "$f" || return 1
+    _LOCK_FILE="$f"
+}
+
+_release_lock() { [[ -n "$_LOCK_FILE" ]] && rm -f "$_LOCK_FILE"; _LOCK_FILE=""; }
 
 # Fills TARGETS with indices into REPO_LIST: every discovered repo, or only the
 # one named by --repo. Shared by maintain and tidy so that --repo means the
