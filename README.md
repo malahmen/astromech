@@ -315,10 +315,11 @@ are what the skip conditions below depend on.
 | `test-prune.sh` | 47 | the `fetch.prune` toggle, its read-back, and the overrides that beat it |
 | `test-local.sh` | 51 | maintenance per repo state: commit, stash, pull, what is skipped, stash counts, and nested roots' ignores |
 | `test-failures.sh` | 18 | a hook refusing the wip commit, main and master together, a file named like the trunk, tidy meeting a run in progress |
-| `test-locked.sh` | 11 | the run lock, including a stale one whose holder is gone |
+| `test-trunks-worktrees.sh` | 47 | long-lived branches: never tidied, never wip-committed by `maintain`; linked worktrees (one stray outside every root is named); a branch rebased or bisected elsewhere; deepest-root attribution; `status` taking no optional locks |
+| `test-locked.sh` | 17 | the run lock: a stale one whose holder is gone, one path whatever the environment, never visible without its pid |
 | `test-default-branch.sh` | 10 | which branch is the trunk, in the orders that matter |
 
-**206 checks** in total.
+**259 checks** in total.
 
 `test-prune.sh` writes to a global git config, so it first proves git honours
 `$GIT_CONFIG_GLOBAL` (2.32+) and skips itself if not — the real `~/.gitconfig`
