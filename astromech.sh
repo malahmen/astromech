@@ -12,6 +12,8 @@
 #     check out main/master
 #   - on main/master with local changes: stash them (untracked included) and
 #     leave the stash for you
+#   - on another long-lived branch (git-flow's main, release/*, stable) with
+#     local changes: skip the repo - never a wip commit there
 #   - then: git pull --rebase
 #
 # Nothing is pushed. A failed step is reported and the repo is left exactly as
@@ -143,6 +145,8 @@ Per repo, maintain does:
   feature branch  -> git add -A; git commit (auto message); git checkout main|master
   main|master     -> if dirty: git stash push -u (the stash is left for you)
   then            -> git pull --rebase
+A long-lived branch that is not the trunk (main, release/*, stable in a git-flow
+repo whose origin/HEAD is develop) is never committed on: dirty, it is skipped.
 Nothing is pushed. A failed step leaves the repo as that step left it (a stopped
 rebase stays stopped for you to resolve) and the run moves on. Repos mid-rebase/
 merge, on a detached HEAD, or with neither main nor master are skipped.
@@ -429,6 +433,17 @@ maintain_repo() {
     branch="$(_current_branch "$repo")" || { _skip "detached HEAD"; return; }
     def="$(_default_branch "$repo")"    || { _skip "no main or master branch"; return; }
 
+    # A long-lived branch that is not the trunk (git-flow: main, release/*,
+    # stable while origin/HEAD names develop) is never wip-committed on: the
+    # next push would publish the commit (Kamino item 170). Skipped, not
+    # stashed - a stash would hide the work and the checkout would then move
+    # the person off the branch they were deliberately on (a hotfix on main);
+    # skipping changes nothing, and the summary says why.
+    if [[ "$branch" != "$def" ]] && _tidy_keep "$branch" && _is_dirty "$repo"; then
+        _skip "uncommitted changes on the long-lived branch '${branch}' (trunk: '${def}') — never auto-committed; commit or stash them yourself"
+        return
+    fi
+
     if [[ "$branch" != "$def" ]]; then
         if _is_dirty "$repo"; then
             if (( DRY_RUN )); then
@@ -629,6 +644,7 @@ cmd_maintain() {
 # develop) a local main behind develop counted as merged and `tidy --yes`
 # deleted it, its upstream setting with it; release/* or stable likewise.
 # Long-lived by convention, and the README promises trunks never appear.
+# maintain reads the same list: it never wip-commits on one (Kamino item 170).
 TIDY_KEEP=(main master develop development trunk stable 'release/*' 'hotfix/*')
 _tidy_keep() {
     local p

@@ -82,6 +82,26 @@ check "tidy --yes deletes the feature branch"   gone "$R/flow" feature
 check "...and leaves main"                      have "$R/flow" main
 
 echo
+echo "== 170: maintain never wip-commits on a long-lived branch =="
+# gf: git-flow (origin/HEAD -> develop); main and release/2.0 tracked on origin.
+# Each is checked out with uncommitted work, as a hotfix in progress would be.
+for b in main release/2.0; do
+    n="gf-${b//\//-}"; mk "$n" develop
+    git -C "$R/$n" checkout -q -b "$b"; git -C "$R/$n" push -q -u origin "$b" 2>/dev/null
+    git -C "$R/$n" remote set-head origin develop
+    echo "hotfix in progress" > "$R/$n/f"
+    before="$(git -C "$R/$n" rev-parse HEAD)"
+    run maintain --dry-run --repo "$R/$n"
+    check "$b: a dry run does not plan a commit"        lacks "would commit" "$ERR"
+    run maintain --repo "$R/$n"
+    check "$b: no commit lands on it"                   test "$(git -C "$R/$n" rev-parse "refs/heads/$b")" = "$before"
+    check "$b: still checked out"                       test "$(git -C "$R/$n" symbolic-ref --short HEAD)" = "$b"
+    check "$b: the work is still in the working tree"   test -n "$(git -C "$R/$n" status --porcelain)"
+    check "$b: skipped, and says why"                   has "long-lived branch '$b'" "$ERR"
+    check "$b: a skip, not a failure (exit 0)"          test "$RC" -eq 0
+done
+
+echo
 echo "== 141: a linked worktree is part of its repository =="
 run repos
 check "the worktree is not listed as a repo"    lacks "wt-linked" "$OUT"

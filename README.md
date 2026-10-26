@@ -29,6 +29,12 @@ These repos are **skipped and reported**, never touched:
 - a rebase, merge, cherry-pick, revert or bisect is in progress
 - detached HEAD
 - neither `main` nor `master` exists, locally or on `origin`
+- local changes on a long-lived branch that is not the trunk — `main`,
+  `master`, `develop`, `development`, `trunk`, `stable`, `release/*`,
+  `hotfix/*` (the names `tidy` never deletes). In a git-flow repo whose
+  `origin/HEAD` is `develop`, a dirty `main` or `release/*` is not a feature
+  branch: a wip commit there is published by the next push. The work stays in
+  the working tree, on that branch, for you to commit or stash.
 
 ## Tidy
 
