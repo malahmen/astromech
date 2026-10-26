@@ -29,6 +29,12 @@ These repos are **skipped and reported**, never touched:
 - a rebase, merge, cherry-pick, revert or bisect is in progress
 - detached HEAD
 - neither `main` nor `master` exists, locally or on `origin`
+- local changes on a long-lived branch that is not the trunk — `main`,
+  `master`, `develop`, `development`, `trunk`, `stable`, `release/*`,
+  `hotfix/*` (the names `tidy` never deletes). In a git-flow repo whose
+  `origin/HEAD` is `develop`, a dirty `main` or `release/*` is not a feature
+  branch: a wip commit there is published by the next push. The work stays in
+  the working tree, on that branch, for you to commit or stash.
 
 ## Tidy
 
@@ -239,8 +245,13 @@ and tidy's plan print their data to stdout.
 
 ## Discovery
 
-Repos are found **recursively** below each root. Any folder containing `.git`
-counts, whether `.git` is a directory or a file (worktrees and submodules). The
+Repos are found **recursively** below each root. A folder containing `.git`
+counts, whether `.git` is a directory or a file (a submodule) — with one
+exception: a linked worktree (`git worktree add`), whose `.git` is also a file,
+is part of its repository and never counted as a repository of its own. When
+that repository is itself under no root (or is ignored), the worktree is not
+maintained, and every run names it in a warning rather than dropping it without
+a word; add the repository's folder as a root to cover it. The
 walk never goes inside a repo it has found, and it skips hidden folders,
 symlinks and ignored folders. It stops at `ASTROMECH_MAX_DEPTH` levels below the
 root (default 6). Ignores apply to a root's **top-level** folders, and an
@@ -266,6 +277,13 @@ ignore=/Users/me/code/archive
 
 Without a terminal, log lines get a UTC timestamp and `GIT_TERMINAL_PROMPT=0` is
 set, so an HTTPS remote that needs credentials fails instead of hanging the run.
+
+`maintain` and `tidy` take one run lock per user,
+`~/.local/state/astromech/run.lock`, so a cron run and one started by hand
+never interleave. The path depends on `$HOME` alone — not on
+`XDG_RUNTIME_DIR` or `XDG_STATE_HOME`, which a desktop session sets and cron
+does not. A lock whose holder is gone (killed, or from before a reboot) is
+reported and taken over.
 
 ## Tests
 
@@ -297,10 +315,11 @@ are what the skip conditions below depend on.
 | `test-prune.sh` | 47 | the `fetch.prune` toggle, its read-back, and the overrides that beat it |
 | `test-local.sh` | 51 | maintenance per repo state: commit, stash, pull, what is skipped, stash counts, and nested roots' ignores |
 | `test-failures.sh` | 18 | a hook refusing the wip commit, main and master together, a file named like the trunk, tidy meeting a run in progress |
-| `test-locked.sh` | 11 | the run lock, including a stale one whose holder is gone |
+| `test-trunks-worktrees.sh` | 47 | long-lived branches: never tidied, never wip-committed by `maintain`; linked worktrees (one stray outside every root is named); a branch rebased or bisected elsewhere; deepest-root attribution; `status` taking no optional locks |
+| `test-locked.sh` | 17 | the run lock: a stale one whose holder is gone, one path whatever the environment, never visible without its pid |
 | `test-default-branch.sh` | 10 | which branch is the trunk, in the orders that matter |
 
-**206 checks** in total.
+**259 checks** in total.
 
 `test-prune.sh` writes to a global git config, so it first proves git honours
 `$GIT_CONFIG_GLOBAL` (2.32+) and skips itself if not — the real `~/.gitconfig`

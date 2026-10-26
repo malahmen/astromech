@@ -15,7 +15,9 @@ T="$(cd "$T" && pwd)"
 export ASTROMECH_CONFIG="$T/cfg/astromech.conf"
 export GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@t GIT_COMMITTER_NAME=t GIT_COMMITTER_EMAIL=t@t
 export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1
-export XDG_RUNTIME_DIR="$T/run"; mkdir -p "$XDG_RUNTIME_DIR"
+# The run lock lives under $HOME (and TMPDIR is where older engines put it):
+# both inside $T, so no run here touches the user's real lock.
+export HOME="$T/home" TMPDIR="$T/tmp"; mkdir -p "$HOME" "$TMPDIR"; unset XDG_RUNTIME_DIR
 
 FAILS=0
 check() { local d="$1"; shift; if "$@"; then echo "   ok   - $d"; else echo "   FAIL - $d"; FAILS=$((FAILS + 1)); fi; }
@@ -98,16 +100,16 @@ check "the first run's summary does not list it" bash -c "grep -q 'c-named' '$T/
 
 echo "## 4. tidy waits for a run in progress"
 git -C "$R/c-named" branch -q done-branch main
-LOCK="$XDG_RUNTIME_DIR/astromech-$(id -u).lock"
+LOCK="$HOME/.local/state/astromech/run.lock"
 sleep 30 & holder=$!
-mkdir -p "$LOCK"; printf '%s\n' "$holder" > "$LOCK/pid"
+mkdir -p "${LOCK%/*}"; printf '%s\n' "$holder" > "$LOCK"
 Arun tidy --yes; rc=$?
 check "tidy refuses"                            [ "$rc" -ne 0 ]
 check "  and says why"                          said "in progress"
 check "  and deleted nothing"                   git -C "$R/c-named" show-ref --verify -q refs/heads/done-branch
 kill "$holder" 2>/dev/null; wait "$holder" 2>/dev/null
-check "the live holder's lock was left alone"   [ -d "$LOCK" ]
-rm -r "$LOCK"
+check "the live holder's lock was left alone"   [ -f "$LOCK" ]
+rm -f "$LOCK"
 
 echo
 if (( FAILS )); then echo "${FAILS} check(s) failed"; exit 1; fi

@@ -12,6 +12,8 @@
 #     check out main/master
 #   - on main/master with local changes: stash them (untracked included) and
 #     leave the stash for you
+#   - on another long-lived branch (git-flow's main, release/*, stable) with
+#     local changes: skip the repo - never a wip commit there
 #   - then: git pull --rebase
 #
 # Nothing is pushed. A failed step is reported and the repo is left exactly as
@@ -143,6 +145,8 @@ Per repo, maintain does:
   feature branch  -> git add -A; git commit (auto message); git checkout main|master
   main|master     -> if dirty: git stash push -u (the stash is left for you)
   then            -> git pull --rebase
+A long-lived branch that is not the trunk (main, release/*, stable in a git-flow
+repo whose origin/HEAD is develop) is never committed on: dirty, it is skipped.
 Nothing is pushed. A failed step leaves the repo as that step left it (a stopped
 rebase stays stopped for you to resolve) and the run moves on. Repos mid-rebase/
 merge, on a detached HEAD, or with neither main nor master are skipped.
@@ -298,16 +302,25 @@ _deepest_root() {
 # suggested -D - and maintain would have wip-committed on it (Kamino item
 # 141). So they are skipped, and repositories are told apart by their shared
 # git dir rather than by path.
+#
+# A linked worktree whose repository was NOT found under any root is the
+# exception that must not vanish without a word (Kamino item 193): it is
+# named, with the reason, on every run. It is still not maintained - its trunk
+# is checked out in the primary worktree, so the checkout would fail, and a
+# wip commit on its branch is exactly what item 141 removed. Covering it means
+# adding the repository's own folder as a root.
 REPO_LIST=(); REPO_ROOT=()
 discover() {
     REPO_LIST=(); REPO_ROOT=()
-    local -A seen=()
+    local -A seen=() orphans=()
     local root repo key
     for root in "${ROOTS[@]}"; do
         if [[ ! -d "$root" ]]; then warn "root not found (skipped): ${root}"; continue; fi
         while IFS= read -r repo; do
             if _is_linked_worktree "$repo"; then
-                dbg "linked worktree, part of $(_common_dir "$repo"): ${repo}"
+                key="$(_common_dir "$repo")"
+                dbg "linked worktree, part of ${key}: ${repo}"
+                orphans[$repo]="$key"
                 continue
             fi
             key="$(_common_dir "$repo" || printf '%s' "$repo")"
@@ -315,6 +328,13 @@ discover() {
             seen[$key]=1
             REPO_LIST+=("$repo"); REPO_ROOT+=("$(_deepest_root "$repo")")
         done < <(_walk "$root" 0)
+    done
+    local primary
+    for repo in "${!orphans[@]}"; do
+        key="${orphans[$repo]}"
+        [[ -n "${seen[$key]:-}" ]] && continue
+        primary="$key"; [[ "$primary" == */.git ]] && primary="${primary%/.git}"
+        warn "linked worktree not maintained: ${repo/#$HOME/\~} belongs to ${primary/#$HOME/\~}, which is under no root (or is ignored) - add that folder as a root to cover it"
     done
 }
 
@@ -429,6 +449,17 @@ maintain_repo() {
     branch="$(_current_branch "$repo")" || { _skip "detached HEAD"; return; }
     def="$(_default_branch "$repo")"    || { _skip "no main or master branch"; return; }
 
+    # A long-lived branch that is not the trunk (git-flow: main, release/*,
+    # stable while origin/HEAD names develop) is never wip-committed on: the
+    # next push would publish the commit (Kamino item 170). Skipped, not
+    # stashed - a stash would hide the work and the checkout would then move
+    # the person off the branch they were deliberately on (a hotfix on main);
+    # skipping changes nothing, and the summary says why.
+    if [[ "$branch" != "$def" ]] && _tidy_keep "$branch" && _is_dirty "$repo"; then
+        _skip "uncommitted changes on the long-lived branch '${branch}' (trunk: '${def}') — never auto-committed; commit or stash them yourself"
+        return
+    fi
+
     if [[ "$branch" != "$def" ]]; then
         if _is_dirty "$repo"; then
             if (( DRY_RUN )); then
@@ -499,30 +530,77 @@ maintain_repo() {
 # the first place: one of them is holding it legitimately while the other
 # reports it as wreckage.
 #
-# A directory, not flock(1): mkdir is atomic everywhere and macOS ships no
-# flock. Under XDG_RUNTIME_DIR when there is one (per-user, tmpfs, cleared on
-# logout), else TMPDIR — which may be shared, hence the uid in the name.
-_LOCK_DIR=""
-_lock_path() { printf '%s/astromech-%s.lock' "${XDG_RUNTIME_DIR:-${TMPDIR:-/tmp}}" "$(id -u)"; }
+# One fixed path per user, under $HOME (Kamino item 193). It used to live under
+# XDG_RUNTIME_DIR when set, else TMPDIR: cron sets neither while a desktop
+# session sets the first, so the cron run and the interactive one each took a
+# lock of their own and excluded nothing. XDG_STATE_HOME is not honoured for
+# the same reason - it is set by a login profile and absent under cron. $HOME
+# is set in both.
+#
+# A file created by link(2), not flock(1) (macOS ships none) nor mkdir. The pid
+# is written to a temporary file first and that file is then linked into place,
+# which is atomic and fails if the lock exists: the lock never exists without
+# its pid. With mkdir-then-write, a second run arriving in between read an
+# empty pid, called the lock stale and removed it from under its live holder.
+#
+# The lock outlives a reboot (it is no longer on a tmpfs), so it records the
+# boot too: after a reboot its pid may belong to some unrelated new process,
+# which must not block maintenance forever.
+_LOCK_FILE=""
+_lock_path() { printf '%s/.local/state/astromech/run.lock' "$HOME"; }
 
-_run_lock() {
-    local d; d="$(_lock_path)"
-    if mkdir "$d" 2>/dev/null; then
-        printf '%s\n' "$$" > "${d}/pid"; _LOCK_DIR="$d"; return 0
-    fi
-    # Held — or abandoned. A holder that no longer exists must not block
-    # maintenance forever: that turns one killed run into a silent stop.
-    local pid; pid="$(cat "${d}/pid" 2>/dev/null || true)"
-    if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
-        return 1
-    fi
-    warn "removing a stale run lock (${d}; pid ${pid:-unknown} is gone)"
-    rm -rf "$d"
-    mkdir "$d" 2>/dev/null || return 1
-    printf '%s\n' "$$" > "${d}/pid"; _LOCK_DIR="$d"
+_boot_id() {
+    cat /proc/sys/kernel/random/boot_id 2>/dev/null \
+        || sysctl -n kern.boottime 2>/dev/null \
+        || true
 }
 
-_release_lock() { [[ -n "$_LOCK_DIR" ]] && rm -rf "$_LOCK_DIR"; _LOCK_DIR=""; }
+# _lock_take FILE — 0 when FILE was created holding this run's pid and boot.
+_lock_take() {
+    local f="$1" tmp rc=0
+    tmp="$(mktemp "${f%/*}/.run.lock.XXXXXX")" || return 1
+    printf '%s\n%s\n' "$$" "$(_boot_id)" > "$tmp" || rc=1
+    (( rc )) || ln "$tmp" "$f" 2>/dev/null || rc=1
+    rm -f "$tmp"
+    return "$rc"
+}
+
+_run_lock() {
+    local f pid="" boot=""; f="$(_lock_path)"
+    mkdir -p "${f%/*}" 2>/dev/null || { error "cannot create ${f%/*}"; return 1; }
+    # ln onto a directory would create a link inside it and "succeed".
+    [[ -d "$f" ]] && { error "${f} is a directory, not a lock file"; return 1; }
+    _lock_take "$f" && { _LOCK_FILE="$f"; return 0; }
+    # Held — or abandoned. A holder that no longer exists must not block
+    # maintenance forever: that turns one killed run into a silent stop.
+    local held old cur=""
+    held="$(cat "$f" 2>/dev/null)" || held=""
+    # Gone since (its holder finished): just try again. Present but empty
+    # cannot come from a live run any more, so it is stale like a dead pid.
+    if [[ -e "$f" ]]; then
+        { IFS= read -r pid; IFS= read -r boot; } <<< "$held"
+        if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null \
+            && { [[ -z "$boot" ]] || [[ "$boot" == "$(_boot_id)" ]] || [[ -z "$(_boot_id)" ]]; }; then
+            return 1
+        fi
+        # Moved aside, not removed, and checked: a second run that judged the
+        # same lock stale may already have replaced it with its own live one.
+        old="${f}.stale.$$"
+        mv -f "$f" "$old" 2>/dev/null || return 1
+        cur="$(cat "$old" 2>/dev/null)" || cur=""
+        if [[ "$cur" != "$held" ]]; then
+            ln "$old" "$f" 2>/dev/null || true
+            rm -f "$old"
+            return 1
+        fi
+        rm -f "$old"
+        warn "removing a stale run lock (${f}; pid ${pid:-unknown} is gone)"
+    fi
+    _lock_take "$f" || return 1
+    _LOCK_FILE="$f"
+}
+
+_release_lock() { [[ -n "$_LOCK_FILE" ]] && rm -f "$_LOCK_FILE"; _LOCK_FILE=""; }
 
 # Fills TARGETS with indices into REPO_LIST: every discovered repo, or only the
 # one named by --repo. Shared by maintain and tidy so that --repo means the
@@ -629,6 +707,7 @@ cmd_maintain() {
 # develop) a local main behind develop counted as merged and `tidy --yes`
 # deleted it, its upstream setting with it; release/* or stable likewise.
 # Long-lived by convention, and the README promises trunks never appear.
+# maintain reads the same list: it never wip-commits on one (Kamino item 170).
 TIDY_KEEP=(main master develop development trunk stable 'release/*' 'hotfix/*')
 _tidy_keep() {
     local p

@@ -21,7 +21,9 @@ T="$(cd "$T" && pwd)"
 export ASTROMECH_CONFIG="$T/cfg/astromech.conf"
 export GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@t GIT_COMMITTER_NAME=t GIT_COMMITTER_EMAIL=t@t
 export GIT_CONFIG_NOSYSTEM=1
-export XDG_RUNTIME_DIR="$T/run"; mkdir -p "$XDG_RUNTIME_DIR"
+# The run lock lives under $HOME (and TMPDIR is where older engines put it):
+# both inside $T, so no run here touches the user's real lock.
+export HOME="$T/home" TMPDIR="$T/tmp"; mkdir -p "$HOME" "$TMPDIR"; unset XDG_RUNTIME_DIR
 
 export GCONF="$T/gitconfig"; export GIT_CONFIG_GLOBAL="$GCONF"; : > "$GCONF"
 git config --global astromech.probe yes 2>/dev/null
