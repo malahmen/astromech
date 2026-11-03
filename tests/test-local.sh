@@ -99,7 +99,8 @@ upstream "$R1/group/nested" main n upstream-n
 upstream "$R1/archive/old" main o upstream-o
 
 echo "## 4. dry run changes nothing"
-Arun maintain --dry-run
+# The steps are the --verbose part of a repo's report (Kamino item 240).
+Arun maintain --dry-run --verbose
 check "dry run says it would commit"        said "would commit all changes on 'feat/x'"
 check "feat-repo still on feat/x"           [ "$(br "$R1/feat-repo")" = feat/x ]
 check "dirty-main still dirty, no stash"    bash -c "! git -C '$R1/dirty-main' stash list | grep -q . && [ -n \"\$(git -C '$R1/dirty-main' status --porcelain)\" ]"
@@ -120,13 +121,13 @@ check "detached HEAD skipped"               said "detached: detached HEAD"
 check "develop-only skipped"                said "develop-only: no main or master branch"
 check "nested repo pulled"                  [ -f "$R1/group/nested/n" ]
 check "ignored repo untouched (not pulled)" [ ! -e "$R1/archive/old/o" ]
-check "second root maintained"              said "── other"
-check "run continued past the conflict"    bash -c "awk '/── conflict/{c=1} c&&/── legacy/{f=1} END{exit !f}' '$T/last.out'"
+check "second root maintained"              said "/work/other  *ok: pulled"
+check "run continued past the conflict"    bash -c "awk '/\/conflict +FAILED:/{c=1} c&&/\/legacy +ok:/{f=1} END{exit !f}' '$T/last.out'"
 
 echo "## 6. rerun: mid-rebase repo is skipped, not touched"
 Arun maintain
 check "in-progress rebase skipped"          said "conflict: rebase in progress"
-check "clean main is a plain pull"          bash -c "grep -A3 '── feat-repo' '$T/last.out' | grep -q '\[ok\].*pulled' && ! grep -A3 '── feat-repo' '$T/last.out' | grep -qE 'committed|stashed'"
+check "clean main is a plain pull"          grep -qE '/feat-repo +ok: pulled$' "$T/last.out"
 
 echo "## 6b. stashes left on the trunk are counted, not lost from view"
 check "the summary lists the kept stash"    said "stashes .*dirty-main: 1 kept"

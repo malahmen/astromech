@@ -118,10 +118,11 @@ git -C "$C/e-tidy" branch -q stale; git -C "$C/e-tidy" branch -q -u origin/old s
 git -C "$C/e-tidy" checkout -q -b work; echo w > "$C/e-tidy/w"; git -C "$C/e-tidy" add w; git -C "$C/e-tidy" commit -qm work
 git -C "$C/e-tidy" checkout -q main
 mkrepo "$C/f-behind"; git -C "$C/f-behind" branch -q done3; upstream "$C/f-behind" g3 up
-X2="$T/x2"; cp -a "$X1" "$X2"
+X2="$T/x2"; cp -a "$X1" "$X2"; X3="$T/x3"; cp -a "$X1" "$X3"
 for r in "$X2"/code/*; do git -C "$r" remote set-url origin "$X2/remotes/${r##*/}.git"; done
-setroot "$X1/code" "$T/c1.conf"; setroot "$X2/code" "$T/c2.conf"
-norm() { sed -E -e 's/^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:]+Z //' -e "s#${X2}#X#g; s#${X1}#X#g" "$1" | grep -v 'repos at a time'; }
+for r in "$X3"/code/*; do git -C "$r" remote set-url origin "$X3/remotes/${r##*/}.git"; done
+setroot "$X1/code" "$T/c1.conf"; setroot "$X2/code" "$T/c2.conf"; setroot "$X3/code" "$T/c3.conf"
+norm() { sed -E -e 's/^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:]+Z //' -e "s#${X3}#X#g; s#${X2}#X#g; s#${X1}#X#g" "$1" | grep -v 'repos at a time'; }
 
 export FAKEGIT_LOG="$T/eq.log" FAKEGIT_SLOW=a-feature FAKEGIT_SLOW_DELAY=3
 # stdout and stderr apart first (a dry run prints tidy's plan on stdout)...
@@ -140,14 +141,16 @@ check "same stderr in a dry run (two streams)"           cmp -s <(norm "$T/d1.er
 check "same stdout (tidy's plan) in a dry run"           cmp -s <(norm "$T/d1.out") <(norm "$T/d4.out")
 check "  which is not empty"                             grep -q done1 "$T/d4.out"
 check "same exit status (1: a repo failed)"              [ "$rc1/$rc4/$drc1" = "1/1/$drc4" ]
-check "the sections are in repo order"                   [ "$(grep -oE '── [a-f]-[a-z]+' "$T/j4.all" | awk '{print $2}' | tr '\n' ' ')" = "a-feature b-stash c-detached d-hook e-tidy f-behind " ]
+# One line per repo (Kamino item 240): "<timestamp> name  state: note".
+repolines() { sed -nE 's/^[0-9T:Z-]+ ([a-f]-[a-z]+) +(ok|skipped|FAILED): .*/\1/p' "$1"; }
+check "the repo lines are in repo order"                 [ "$(repolines "$T/j4.all" | tr '\n' ' ')" = "a-feature b-stash c-detached d-hook e-tidy f-behind " ]
 check "  although a-feature's pull finished last"        grep -q "^E $X2/code/a-feature/" <(grep '^E' "$T/eq.log" | tail -1)
-sections=$(grep -c '── ' "$T/j4.all")
+sections=$(repolines "$T/j4.all" | wc -l | tr -d ' ')
 read -r ok sk fl < <(sed -nE 's/.*Summary: ([0-9]+) ok, ([0-9]+) skipped, ([0-9]+) failed\..*/\1 \2 \3/p' "$T/j4.all")
 read -r del ref < <(sed -nE 's/.*Tidy: ([0-9]+) branch\(es\) deleted, ([0-9]+) refused\..*/\1 \2/p' "$T/j4.all")
 check "totals add up to the repos: ${ok:-?}+${sk:-?}+${fl:-?} = ${sections}" [ "$(( ${ok:-0} + ${sk:-0} + ${fl:-0} ))/$sections" = "6/6" ]
 check "  4 ok, 1 skipped, 1 failed"                      [ "${ok:-}/${sk:-}/${fl:-}" = "4/1/1" ]
-check "tidy's counts add up: ${del:-?} deleted"          [ "${del:-x}/$(grep -c '\[info\]  deleted ' "$T/j4.all")" = "3/3" ]
+check "tidy's counts add up: ${del:-?} deleted"          [ "${del:-x}/$(grep -oE '[0-9]+ branch(es)? deleted' "$T/j4.all" | awk '{s += $1} END {print s}')" = "3/3" ]
 check "  ${ref:-?} refused, each listed"                 [ "${ref:-x}/$(grep -c 'REFUSED ' "$T/j4.all")" = "1/1" ]
 check "  and the same under --jobs 1"                    [ "$(grep -E 'Summary:|Tidy:' "$T/j1.all" | norm /dev/stdin)" = "$(grep -E 'Summary:|Tidy:' "$T/j4.all" | norm /dev/stdin)" ]
 check "the work really was done under --jobs 4"          bash -c "[ -f '$X2/code/a-feature/g1' ] && [ -f '$X2/code/f-behind/g3' ] && ! git -C '$X2/code/e-tidy' show-ref -q --verify refs/heads/done1"
@@ -339,6 +342,48 @@ if command -v perl >/dev/null; then
 else
     echo "   skip - no perl: SIGINT is not exercised"
 fi
+
+echo "## 8. one line per repo, off a terminal (Kamino item 240)"
+# Section 1's runs, read for their format: "<timestamp> name  state: note",
+# printed in repo order as each completes, no escape sequences, the per-step
+# lines kept for --verbose and git's own words kept under a failure.
+EXPECTED_LINES="a-feature   ok: committed 'feature', feature → main, pulled
+b-stash     ok: stashed, pulled
+c-detached  skipped: detached HEAD
+d-hook      FAILED: commit on 'feature' failed (hook? identity?) — nothing changed
+e-tidy      ok: pulled, 2 branches deleted, 1 refused
+f-behind    ok: pulled, 1 branch deleted"
+EXPECTED_DRY="a-feature   ok: dry run: committed 'feature' feature → main pull
+b-stash     ok: dry run: stashed pull
+c-detached  skipped: detached HEAD
+d-hook      ok: dry run: committed 'feature' feature → main pull
+e-tidy      ok: dry run: pull, 3 branches would be deleted
+f-behind    ok: dry run: pull, 1 branch would be deleted"
+lines_of() { norm "$1" | grep -E '^[a-f]-[a-z]+ +(ok|skipped|FAILED): '; }
+check "--jobs 4: exactly these lines"                    [ "$(lines_of "$T/j4.all")" = "$EXPECTED_LINES" ]
+check "--jobs 1: the same lines"                         [ "$(lines_of "$T/j1.all")" = "$EXPECTED_LINES" ]
+check "a dry run: these"                                 [ "$(lines_of "$T/d4.err")" = "$EXPECTED_DRY" ]
+check "  with --jobs 1 too"                              [ "$(lines_of "$T/d1.err")" = "$EXPECTED_DRY" ]
+check "each line carries the log's timestamp"            [ "$(grep -cE '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:]+Z [a-f]-[a-z]+ +(ok|skipped|FAILED): ' "$T/j4.all")" -eq 6 ]
+check "no heading lines any more"                        bash -c "! grep -q '── ' '$T/j4.all' '$T/j1.all'"
+check "no escape sequences"                              bash -c "! grep -q \$'\\033' '$T/j4.all' '$T/j1.all' '$T/d4.err'"
+check "no step lines without --verbose"                  bash -c "! grep -qE 'committed changes|checked out|stashed local|would commit|\\[info\\]  deleted ' '$T/j4.all' '$T/d4.err'"
+check "git's reason right under the failed repo's line"  [ "$(grep -A1 -E ' d-hook +FAILED:' "$T/j4.all" | tail -1)" = "          hook says no" ]
+check "  and git's refusal under the repo tidy was refused in" bash -c "grep -A4 -E ' e-tidy +ok:' '$T/j4.all' | grep -q 'not fully merged'"
+check "a dry run's plan still on stdout, after its line" bash -c "grep -q done1 '$T/d4.out' && ! grep -q done1 '$T/d4.err'"
+check "the summary is as it was"                         [ "$(norm "$T/j4.all" | sed -n '/^$/,$p')" = "$(printf '\n%s\n%s\n%s\n          %s\n          %s\n          %s\n          %s' \
+    '[info]  Summary: 4 ok, 1 skipped, 1 failed.' '[info]  Tidy: 3 branch(es) deleted, 1 refused.' \
+    '[info]  Stashes: 1 repo(s) hold changes astromech stashed and nobody has picked up.' \
+    'skipped  X/code/c-detached: detached HEAD' \
+    "FAILED   X/code/d-hook: commit on 'feature' failed (hook? identity?) — nothing changed" \
+    'REFUSED  X/code/e-tidy: stale (c13040c) — git -C X/code/e-tidy branch -D stale  # contained in origin/main' \
+    'stashes  X/code/b-stash: 1 kept (git -C X/code/b-stash stash list)')" ]
+ASTROMECH_CONFIG="$T/c3.conf" bash "$AM" maintain --dry-run --tidy --verbose --jobs 4 >"$T/v4.out" 2>"$T/v4.err"
+# a-feature's steps sit between its line and b-stash's.
+steps() { norm "$T/v4.err" | sed -n '/^a-feature /,/^b-stash /p'; }
+check "--verbose: each repo's steps under its line"     bash -c "grep -q \"would commit all changes on 'feature'\" <<<\"\$1\" && grep -q \"would check out 'main'\" <<<\"\$1\"" _ "$(steps)"
+check "  in repo order"                                  [ "$(lines_of "$T/v4.err" | cut -d' ' -f1 | tr '\n' ' ')" = "a-feature b-stash c-detached d-hook e-tidy f-behind " ]
+check "  the lines themselves unchanged"                 [ "$(lines_of "$T/v4.err")" = "$EXPECTED_DRY" ]
 
 echo
 if (( FAILS )); then echo "${FAILS} check(s) failed"; exit 1; fi

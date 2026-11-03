@@ -19,10 +19,10 @@
 # Nothing is pushed. A failed step is reported and the repo is left exactly as
 # that step left it — a stopped rebase stays stopped for whoever ran
 # maintenance to resolve — and the run moves on to the next repo. Up to
-# --jobs repos (default 4) are maintained at once, each one's report printed
-# whole and in order; --jobs 1 is one at a time. Repos that
-# are mid-rebase/merge, on a detached HEAD, or have neither main nor master are
-# skipped and reported, never touched.
+# --jobs repos (default 4) are maintained at once; --jobs 1 is one at a time.
+# Each repo is one line, printed in order (on a terminal, drawn live while it
+# runs). Repos that are mid-rebase/merge, on a detached HEAD, or have neither
+# main nor master are skipped and reported, never touched.
 #
 # `tidy` is the other half: it deletes local branches whose work the trunk
 # already holds. Git has no configuration that does this — fetch.prune only
@@ -69,17 +69,20 @@ _ts() { date -u +%Y-%m-%dT%H:%M:%SZ; }
 # mail spool or a log file has no other clock; a terminal already has one, and
 # gets colour instead.
 if [[ -t 2 ]]; then
-    C_G=$'\033[0;32m'; C_Y=$'\033[0;33m'; C_R=$'\033[0;31m'; C_C=$'\033[0;36m'; C_B=$'\033[1m'; C_N=$'\033[0m'
+    C_G=$'\033[0;32m'; C_Y=$'\033[0;33m'; C_R=$'\033[0;31m'; C_C=$'\033[0;36m'; C_N=$'\033[0m'
     _pfx() { printf ''; }
 else
-    C_G=""; C_Y=""; C_R=""; C_C=""; C_B=""; C_N=""
+    C_G=""; C_Y=""; C_R=""; C_C=""; C_N=""
     _pfx() { printf '%s ' "$(_ts)"; }
 fi
 
 info()       { printf '%s%s[info]%s  %s\n'  "$(_pfx)" "$C_C" "$C_N" "$*" >&2; }
 success()    { printf '%s%s[ok]%s    %s\n'  "$(_pfx)" "$C_G" "$C_N" "$*" >&2; }
-warn()       { printf '%s%s[warn]%s  %s\n'  "$(_pfx)" "$C_Y" "$C_N" "$*" >&2; }
-error()      { printf '%s%s[error]%s %s\n'  "$(_pfx)" "$C_R" "$C_N" "$*" >&2; }
+# _NWARN counts what warned or failed, so a repo's buffered report can be shown
+# under its line when something in it asks to be read (Kamino item 240).
+_NWARN=0
+warn()       { _NWARN=$(( _NWARN + 1 )); printf '%s%s[warn]%s  %s\n'  "$(_pfx)" "$C_Y" "$C_N" "$*" >&2; }
+error()      { _NWARN=$(( _NWARN + 1 )); printf '%s%s[error]%s %s\n'  "$(_pfx)" "$C_R" "$C_N" "$*" >&2; }
 error_exit() { error "$*"; exit 1; }
 dbg()        { if (( VERBOSE )); then printf '%s[debug] %s\n' "$(_pfx)" "$*" >&2; fi; }
 
@@ -146,7 +149,7 @@ FLAGS
                            (default ${JOBS_DEFAULT}, or jobs= in the config); 1 = one at a time
   --dry-run                prune: report the change, write nothing
   -y, --yes                tidy: delete without asking (required when there is no terminal)
-  -v, --verbose            debug logging
+  -v, --verbose            maintain: every repo's steps under its line; debug logging
   -h, --help
 
 Per repo, maintain does:
@@ -159,9 +162,12 @@ Nothing is pushed. A failed step leaves the repo as that step left it (a stopped
 rebase stays stopped for you to resolve) and the run moves on. Repos mid-rebase/
 merge, on a detached HEAD, or with neither main nor master are skipped.
 
-With more than one job, each repo's report is held until it and every repo
-before it are done, so the output reads as it does with --jobs 1. Nothing may
-prompt then: GIT_TERMINAL_PROMPT=0, and ssh runs with -o BatchMode=yes (added to
+Each repo is one line - "name  ok: what was done", "skipped: why", "FAILED:
+why" - printed once it and every repo before it are done, so the output reads
+the same with any --jobs; git's own output is shown under a line that failed,
+and --verbose shows every step. On a terminal the repos still running are drawn
+in place below the finished ones. With more than one job nothing may prompt:
+GIT_TERMINAL_PROMPT=0, and ssh runs with -o BatchMode=yes (added to
 GIT_SSH_COMMAND or core.sshCommand), so credentials must come from ssh-agent or
 a credential helper, as under cron; a repo that would ask fails instead.
 
@@ -540,10 +546,11 @@ _in_progress() {
 # -----------------------------------------------------------------------------
 
 # Result of the last maintain_repo: R_STATUS = ok|skipped|failed, R_NOTE = why.
+# Not printed here: the repo's one line says it (Kamino item 240).
 R_STATUS=""; R_NOTE=""
-_ok()   { R_STATUS=ok;      R_NOTE="$1"; success "$1"; }
-_skip() { R_STATUS=skipped; R_NOTE="$1"; warn "skipped: $1"; }
-_fail() { R_STATUS=failed;  R_NOTE="$1"; error "$1"; }
+_ok()   { R_STATUS=ok;      R_NOTE="$1"; }
+_skip() { R_STATUS=skipped; R_NOTE="$1"; }
+_fail() { R_STATUS=failed;  R_NOTE="$1"; }
 
 maintain_repo() {
     local repo="$1" op branch def dirty notes=() stamp
@@ -578,6 +585,7 @@ maintain_repo() {
             if (( DRY_RUN )); then
                 info "would commit all changes on '${branch}'"
             else
+                _phase committing
                 # '|| true' on the recovery, like the commit branch below.
                 # Without it this was fatal to the WHOLE RUN: errexit applies
                 # inside the { } group, 'add -A' fails on a stale index.lock,
@@ -601,6 +609,7 @@ maintain_repo() {
         if (( DRY_RUN )); then
             info "would check out '${def}'"
         else
+            _phase "checking out"
             # '--': a tracked file named like the trunk makes a bare
             # 'checkout main' ambiguous whenever main exists only on origin,
             # and git then refuses it on every run.
@@ -612,6 +621,7 @@ maintain_repo() {
         if (( DRY_RUN )); then
             info "would stash local changes on '${def}'"
         else
+            _phase stashing
             _git "$repo" stash push -q -u -m "astromech: before pull (${stamp})" \
                 || { _fail "stash on '${def}' failed — nothing changed"; return; }
             info "stashed local changes on '${def}' (left in the stash: git stash list)"
@@ -625,6 +635,7 @@ maintain_repo() {
         _ok "dry run: ${notes[*]}"; return
     fi
 
+    _phase pulling
     if ! _git "$repo" pull -q --rebase; then
         if [[ "$(_in_progress "$repo")" == rebase ]]; then
             _fail "pull --rebase stopped on a conflict — left mid-rebase for you (git status; rebase --continue/--abort)"
@@ -633,6 +644,7 @@ maintain_repo() {
         fi
         return
     fi
+    info "pulled '${def}'"
     notes+=("pulled")
     local joined; joined="$(IFS=,; echo "${notes[*]}")"
     _ok "${joined//,/, }"
@@ -739,12 +751,11 @@ cmd_maintain() {
     # Taken before discovery so two runs cannot both walk the roots and then
     # both start writing.
     _run_lock || error_exit "another ${SCRIPT_NAME} maintenance run is in progress (lock: $(_lock_path)). Wait for it, or remove the lock if you are sure it is dead."
-    trap '_release_lock' EXIT
+    trap '_on_exit' EXIT
     load_config
     (( ${#ROOTS[@]} )) || error_exit "No roots configured. Add one: ${SCRIPT_NAME}.sh add-root PATH"
     discover
 
-    local i
     _select_targets
     local targets=("${TARGETS[@]}")
     (( ${#targets[@]} )) || { warn "No repositories found under the configured roots."; return 0; }
@@ -764,14 +775,16 @@ cmd_maintain() {
 
     local n_ok=0 n_skip=0 n_fail=0 lines=() stashed=()
     if (( jobs > 1 )); then
-        _PAR_KIND=maintain
-        _par_run "$jobs" "${targets[@]}"
-    else
-        for i in "${targets[@]}"; do
-            _maintain_one "$i"
-            _maintain_tally "$i" "$(_stashes "${REPO_LIST[$i]}")"
-        done
+        # Nothing may prompt with several repos at once (see below).
+        export GIT_TERMINAL_PROMPT=0
+        info "Up to ${jobs} repos at a time (--jobs 1 for one at a time). Nothing may prompt: GIT_TERMINAL_PROMPT=0 and ssh -o BatchMode=yes, so credentials must come from ssh-agent or a credential helper."
+        if [[ -n "${GIT_SSH:-}" && -z "${GIT_SSH_COMMAND:-}" ]]; then
+            warn "GIT_SSH is set (${GIT_SSH}): a program, so BatchMode cannot be added to it - it must not prompt either. GIT_SSH_COMMAND would let astromech add it."
+        fi
     fi
+    _live_init
+    _PAR_KIND=maintain _PH0=checking
+    _par_run "$jobs" "${targets[@]}"
 
     printf '\n' >&2
     info "Summary: ${n_ok} ok, ${n_skip} skipped, ${n_fail} failed."
@@ -782,19 +795,17 @@ cmd_maintain() {
     (( n_fail == 0 && TIDY_FAILED == 0 ))
 }
 
-# _maintain_one I — one repo's whole job: its heading, maintain_repo, and its
-# tidy. Leaves R_STATUS/R_NOTE and adds to TIDY_DELETED/TIDY_FAILED/TIDY_LINES.
+# _maintain_one I — one repo's whole job: maintain_repo, then its tidy. Leaves
+# R_STATUS/R_NOTE and adds to TIDY_DELETED/TIDY_FAILED/TIDY_LINES.
 _maintain_one() {
-    local i="$1" rel
-    rel="${REPO_LIST[$i]#"${REPO_ROOT[$i]}"/}"
-    [[ "${REPO_LIST[$i]}" == "${REPO_ROOT[$i]}" ]] && rel="."
-    printf '\n%s%s── %s%s  %s\n' "$(_pfx)" "$C_B" "$rel" "$C_N" "(${REPO_ROOT[$i]/#$HOME/\~})" >&2
+    local i="$1"
     maintain_repo "${REPO_LIST[$i]}"
     # Only after a repo came back clean and up to date: the pull is what makes
     # origin/<trunk> current, and tidying against a stale one would spare
     # branches it already holds. A repo that was skipped or failed keeps all
     # of its branches.
     if [[ "$R_STATUS" == ok ]] && (( TIDY )); then
+        _phase tidying
         TIDY_PLAN=(); TIDY_NOTES=()
         _tidy_plan_repo "${REPO_LIST[$i]}"
         if (( DRY_RUN )); then _tidy_print_plan
@@ -816,25 +827,82 @@ _maintain_tally() {
     return 0
 }
 
+# _maintain_body K — maintains _PAR_TG[K] (in a job, or in-process with
+# --jobs 1) and writes its result: status, note, tidy's counts, the stash
+# count, how many warnings it printed, how many branches tidy planned, then
+# tidy's REFUSED lines. Tidy's counters are local: the parent adds them up
+# from the result, whichever way the repo ran.
+_maintain_body() {
+    local k="$1" i="${_PAR_TG[$1]}" ns
+    local TIDY_DELETED=0 TIDY_FAILED=0 TIDY_LINES=() TIDY_PLAN=() TIDY_NOTES=() _NWARN=0
+    _maintain_one "$i"
+    ns="$(_stashes "${REPO_LIST[$i]}")"
+    _par_result "$k" "$R_STATUS" "$R_NOTE" "$TIDY_DELETED" "$TIDY_FAILED" "$ns" "$_NWARN" "${#TIDY_PLAN[@]}" "${TIDY_LINES[@]}"
+}
+
+# _maintain_text — the state word and note of the result in _RES.
+_maintain_text() {
+    case "${_RES[0]}" in ok) _TS=ok ;; skipped) _TS=skipped ;; *) _TS=FAILED ;; esac
+    _TN="${_RES[1]}"
+    if [[ "${_RES[0]}" == ok ]] && (( TIDY )); then
+        if (( DRY_RUN )); then
+            (( _RES[6] )) && _TN+=", $(_nbr "${_RES[6]}") would be deleted"
+        else
+            (( _RES[2] )) && _TN+=", $(_nbr "${_RES[2]}") deleted"
+            (( _RES[3] )) && _TN+=", ${_RES[3]} refused"
+        fi
+    fi
+    return 0
+}
+
+_flush_maintain() {
+    local k="$1" rc="$2" i="${_PAR_TG[$1]}" ns details="$VERBOSE"
+    if _res_read "$k"; then
+        R_STATUS="${_RES[0]}"; R_NOTE="${_RES[1]}"; ns="${_RES[4]}"
+        TIDY_DELETED=$(( TIDY_DELETED + _RES[2] )); TIDY_FAILED=$(( TIDY_FAILED + _RES[3] ))
+        (( ${#_RES[@]} > 7 )) && TIDY_LINES+=("${_RES[@]:7}")
+        # Something to read beyond the line: a refusal, or a warning.
+        (( _RES[3] || _RES[5] )) && details=1
+    else
+        R_STATUS=failed
+        R_NOTE="maintenance stopped unexpectedly (exit ${rc}) — the repo may be mid-step; look at it with git status"
+        ns="$(_stashes "${REPO_LIST[$i]}")"
+        _RES=(failed "$R_NOTE" 0 0 "$ns" 0 0)
+    fi
+    [[ "$R_STATUS" == failed ]] && details=1
+    _maintain_text
+    _par_emit "$k" "$_TS" "$_TN" "$details"
+    _maintain_tally "$i" "$ns"
+}
+
 # -----------------------------------------------------------------------------
-# maintain, several repos at once (Kamino item 238); status too (239)
+# The job runner: several repos at once (Kamino item 238), one line each
+# (Kamino item 240)
 # -----------------------------------------------------------------------------
 #
 # A pull is network-bound, so one repo at a time made a run as long as the sum
-# of its pulls. With --jobs N, up to N repos run their whole job (maintain_repo,
-# then its tidy) at once, each in a background subshell. The same runner makes
-# status's rows (_PAR_KIND=status: reading only, so none of the rules below
-# about git dirs or prompts applies, and nothing is printed until the tree):
+# of its pulls. With --jobs N, up to N repos run their whole job at once, each
+# in a background subshell. The runner serves maintain (each repo's
+# maintain_repo and its tidy) and status (each repo's rows), told apart by
+# _PAR_KIND:
 #
-#   - its output goes to a buffer of its own, and its result (R_STATUS/R_NOTE,
-#     tidy's counts and REFUSED lines, its stash count) to a file - a subshell
-#     cannot set the parent's globals. The parent prints a repo as soon as it
-#     and every repo before it are done, so the report reads exactly as with
-#     --jobs 1 and still streams;
-#   - two repos whose git dirs are the same or nested never run at once. One
-#     entry per git dir is already discovery's rule; a submodule's git dir
-#     (inside the superproject's .git/modules) is the nested case, written by
-#     the superproject's own pull too (fetch.recurseSubmodules=on-demand);
+#   - a job's output goes to a buffer of its own, and its result to a file - a
+#     subshell cannot set the parent's globals. The parent prints a repo once
+#     it and every repo before it are done, so the report is in repo order
+#     whatever finished first, and --jobs 1 (each repo in-process, buffered
+#     the same way) prints the same bytes;
+#   - each repo is one line: "name  ok: notes", "skipped: why", "FAILED: why".
+#     The buffer - the steps taken, git's own output - is printed under the
+#     line only when there is something to read in it: the repo failed, tidy
+#     was refused, or something warned; --verbose prints it for every repo;
+#   - on a terminal the repos still running are drawn as a live block under
+#     the finished lines and redrawn in place (_live_*);
+#   - two repos whose git dirs are the same or nested are never maintained at
+#     once. One entry per git dir is already discovery's rule; a submodule's
+#     git dir (inside the superproject's .git/modules) is the nested case,
+#     written by the superproject's own pull too
+#     (fetch.recurseSubmodules=on-demand). Reading (status) has no such
+#     rule;
 #   - nothing may prompt: no one could answer, and a background job reading the
 #     terminal would stop the run for good. GIT_TERMINAL_PROMPT=0, ssh gets
 #     -o BatchMode=yes, stdin is /dev/null, and SIGTTIN/SIGTTOU are ignored so
@@ -844,16 +912,28 @@ _maintain_tally() {
 #   - each job is its own process group, so Ctrl-C/TERM/HUP stops the jobs and
 #     every git under them, and the EXIT trap still releases the run lock.
 
-_PAR_KIND=""   # what runs per repo: maintain | status
-_PAR_DIR=""; _PAR_SAME=0; _PAR_TG=(); _PAR_PID=(); _PAR_STATE=()   # 0 waiting, 1 running, 2 done, 3 printed
-_RES=()
+_PAR_KIND=""; _PH0=""   # what runs per repo: maintain|status; a job's first phase
+_PAR_DIR=""; _PAR_TG=(); _PAR_PID=(); _PAR_STATE=()   # 0 waiting, 1 running, 2 done, 3 printed
+_PAR_N=0; _PAR_DONE=0; _PAR_CUR=0; _PAR_T0=(); _PAR_PH=(); _PAR_LS=(); _PAR_LN=()
+_PHASE_FILE=""; _RES=(); _TS=""; _TN=""; _NAME=(); _NAMEW=0
 
 _par_cleanup() { [[ -z "$_PAR_DIR" ]] || rm -rf "$_PAR_DIR"; _PAR_DIR=""; }
+
+_on_exit() { _live_restore; _par_cleanup; _release_lock; return 0; }
+
+_nbr() { if (( $1 == 1 )); then printf '1 branch'; else printf '%d branches' "$1"; fi; }
+
+# _phase WHAT — the step a repo's job is on ("pulling"), for the live line.
+_phase() {
+    if [[ -n "$_PHASE_FILE" ]]; then printf '%s' "$1" > "$_PHASE_FILE" 2>/dev/null || true; fi
+    if (( _LIVE_LINE )); then _live_running "$_PAR_CUR" "$1"; fi
+    return 0
+}
 
 # _batch_ssh REPO — makes ssh non-interactive for REPO's git without losing
 # the ssh command it would have used: GIT_SSH_COMMAND, else core.sshCommand
 # (git's own order), else plain ssh. GIT_SSH names a program, which cannot be
-# given options; it is left alone (and said so once, in _maintain_parallel).
+# given options; it is left alone (and said so once, in cmd_maintain).
 _batch_ssh() {
     local cmd="${GIT_SSH_COMMAND:-}"
     if [[ -z "$cmd" ]]; then
@@ -880,21 +960,22 @@ _res_read() {
     return 0
 }
 
-# _maintain_job K — the background job for _PAR_TG[K]. Its result file is
-# written last and renamed into place: no file means the job did not finish.
-_maintain_job() {
-    local k="$1" i="${_PAR_TG[$1]}" ns res="${_PAR_DIR}/$1.res"
-    trap - EXIT INT TERM HUP
+_par_body() {
+    case "$_PAR_KIND" in
+        maintain) _maintain_body "$1" ;;
+        status)   _status_body "$1" ;;
+    esac
+}
+
+# _par_job K — the background job for _PAR_TG[K].
+_par_job() {
+    local k="$1"
+    trap - EXIT INT TERM HUP WINCH
     trap '' TTIN TTOU
-    _batch_ssh "${REPO_LIST[$i]}"
-    TIDY_DELETED=0; TIDY_FAILED=0; TIDY_LINES=()
-    _maintain_one "$i"
-    ns="$(_stashes "${REPO_LIST[$i]}")"
-    {
-        printf '%s\0' "$R_STATUS" "$R_NOTE" "$TIDY_DELETED" "$TIDY_FAILED" "$ns"
-        (( ${#TIDY_LINES[@]} == 0 )) || printf '%s\0' "${TIDY_LINES[@]}"
-    } > "${res}.tmp"
-    mv -f "${res}.tmp" "$res"
+    _LIVE=0; _LIVE_LINE=0; _LIVE_BLOCK=0; _LIVE_HID=0; _LIVE_OPEN=0
+    _PHASE_FILE="${_PAR_DIR}/${k}.phase"
+    if [[ "$_PAR_KIND" == maintain ]]; then _batch_ssh "${REPO_LIST[${_PAR_TG[$k]}]}"; fi
+    _par_body "$k"
 }
 
 # _par_conflict K — 0 when a running job's git dir is K's, or holds it, or
@@ -914,44 +995,54 @@ _par_spawn() {
     # Job control on for the fork only: each job then gets a process group of
     # its own, which _par_abort can signal whole.
     set -m
-    if [[ "$_PAR_KIND" == status ]]; then
-        ( trap - EXIT INT TERM HUP; _status_body "$k" ) </dev/null >"${d}/${k}.out" 2>"${d}/${k}.err" &
-    elif (( _PAR_SAME )); then
-        ( _maintain_job "$k" ) </dev/null >"${d}/${k}.err" 2>&1 &
-    else
-        ( _maintain_job "$k" ) </dev/null >"${d}/${k}.out" 2>"${d}/${k}.err" &
-    fi
+    ( _par_job "$k" ) </dev/null >"${d}/${k}.out" 2>"${d}/${k}.err" &
     _PAR_PID[k]=$!
     set +m
-    _PAR_STATE[k]=1
+    _PAR_STATE[k]=1; _PAR_T0[k]=$SECONDS
 }
 
-# _par_replay K — job K's output, to where --jobs 1 would have written it.
-_par_replay() {
-    local d="$_PAR_DIR"
-    [[ -f "${d}/$1.err" ]] && cat "${d}/$1.err" >&2
-    [[ -f "${d}/$1.out" ]] && cat "${d}/$1.out"
+# _par_emit K STATE NOTE DETAILS — repo K's line, for good; then its buffer
+# when DETAILS is 1 (all of it with --verbose), then what it wrote on stdout
+# (tidy's plan in a dry run).
+_par_emit() {
+    local k="$1" d="$_PAR_DIR"
+    _state_style "$2"
+    _row "${_PAR_TG[$k]}" "$2" "$3" "$_SYM" "$_COL" 1
+    if (( _LIVE )); then printf '\r\033[2K%s\n' "$_ROW" >&"$_LIVE_FD"; _LIVE_OPEN=0
+    else printf '%s\n' "$_ROW" >&2; fi
+    # The steps taken ([info]) only with --verbose: otherwise what is shown
+    # is what explains the line - git's own words, a warning.
+    if (( $4 )) && [[ -s "${d}/${k}.err" ]]; then
+        if (( VERBOSE )); then cat "${d}/${k}.err" >&2
+        else grep -vF '[info]' "${d}/${k}.err" >&2 || true; fi
+    fi
+    if [[ -s "${d}/${k}.out" ]]; then cat "${d}/${k}.out"; fi
     return 0
 }
 
-# _par_flush K RC — prints job K and counts its result.
+# _par_flush K RC — prints job K (in repo order) and counts its result.
 _par_flush() {
-    local k="$1" rc="$2" i="${_PAR_TG[$1]}" f=() x ns
-    if [[ "$_PAR_KIND" == status ]]; then _flush_status "$k" "$rc"; _PAR_STATE[k]=3; return 0; fi
-    _par_replay "$k"
-    if [[ -f "${_PAR_DIR}/${k}.res" ]]; then
-        while IFS= read -r -d '' x; do f+=("$x"); done < "${_PAR_DIR}/${k}.res"
-        R_STATUS="${f[0]}"; R_NOTE="${f[1]}"; ns="${f[4]}"
-        TIDY_DELETED=$(( TIDY_DELETED + f[2] )); TIDY_FAILED=$(( TIDY_FAILED + f[3] ))
-        (( ${#f[@]} > 5 )) && TIDY_LINES+=("${f[@]:5}")
+    (( _LIVE_BLOCK )) && _live_clear
+    case "$_PAR_KIND" in
+        maintain) _flush_maintain "$1" "$2" ;;
+        status)   _flush_status "$1" "$2" ;;
+    esac
+    _PAR_STATE[$1]=3
+}
+
+# _par_cache K RC — the final state of a job that is done but not yet printed
+# (one before it is still running), for the live block.
+_par_cache() {
+    local k="$1" rc="$2"
+    if _res_read "$k"; then
+        case "$_PAR_KIND" in
+            maintain) _maintain_text ;;
+            *)        _TS=ok; _TN="" ;;
+        esac
     else
-        R_STATUS=failed
-        R_NOTE="maintenance stopped unexpectedly (exit ${rc}) — the repo may be mid-step; look at it with git status"
-        error "$R_NOTE"
-        ns="$(_stashes "${REPO_LIST[$i]}")"
+        _TS=FAILED; _TN="stopped unexpectedly (exit ${rc})"
     fi
-    _maintain_tally "$i" "$ns"
-    _PAR_STATE[k]=3
+    _PAR_LS[k]="$_TS"; _PAR_LN[k]="$_TN"
 }
 
 # _par_alive K... — 0 while anything in one of these jobs' process groups runs.
@@ -963,9 +1054,10 @@ _par_alive() {
 
 # _par_abort SIGNAL — the INT/TERM/HUP trap while jobs run: stop every job's
 # process group, print what the started repos reported, and exit; the EXIT
-# trap then removes the buffers and releases the run lock.
+# trap then removes the buffers, puts the cursor back and releases the run
+# lock.
 _par_abort() {
-    local sig="$1" k n code=130 stopped=()
+    local sig="$1" k n det code=130 stopped=() names=()
     trap '' INT TERM HUP
     set +m   # in case the signal landed inside _par_spawn
     case "$sig" in TERM) code=143 ;; HUP) code=129 ;; esac
@@ -983,68 +1075,289 @@ _par_abort() {
         kill -KILL -- "-${_PAR_PID[k]}" 2>/dev/null || true
         wait "${_PAR_PID[k]}" 2>/dev/null || true
     done
-    [[ "$_PAR_KIND" == status ]] && exit "$code"
-    # Everything started and not yet printed, in order; a job that was still
-    # running is reported stopped unless its result shows it had finished.
-    local names=()
-    for k in "${!_PAR_STATE[@]}"; do
-        (( _PAR_STATE[k] == 1 || _PAR_STATE[k] == 2 )) || continue
-        _par_replay "$k"
-        if (( _PAR_STATE[k] == 1 )) && [[ ! -f "${_PAR_DIR}/${k}.res" ]]; then
-            error "stopped by SIG${sig} — this repo may be mid-step; look at it with git status"
-            names+=("${REPO_LIST[${_PAR_TG[$k]}]/#$HOME/\~}")
-        fi
-    done
-    printf '\n' >&2
-    warn "interrupted (SIG${sig}): ${#names[@]} repo(s) stopped mid-job${names[*]:+: ${names[*]}}; repos not started were not maintained."
+    (( _LIVE_BLOCK )) && _live_clear
+    if [[ "$_PAR_KIND" == maintain ]]; then
+        # Every repo not yet printed, in order: what the finished ones
+        # reported, the stopped ones as stopped; on a terminal the ones never
+        # started too, so the block ends saying what became of each.
+        for (( k = _PAR_DONE; k < _PAR_N; k++ )); do
+            if (( _PAR_STATE[k] >= 1 )) && _res_read "$k"; then
+                _maintain_text
+                det="$VERBOSE"; (( _RES[3] || _RES[5] )) && det=1; [[ "$_TS" == FAILED ]] && det=1
+                _par_emit "$k" "$_TS" "$_TN" "$det"
+            elif (( _PAR_STATE[k] >= 1 )); then
+                _par_emit "$k" stopped "by SIG${sig} — this repo may be mid-step; look at it with git status" 1
+                names+=("${REPO_LIST[${_PAR_TG[$k]}]/#$HOME/\~}")
+            elif (( _LIVE )); then
+                _par_emit "$k" "not started" "" 0
+            fi
+        done
+        _live_finish
+        printf '\n' >&2
+        warn "interrupted (SIG${sig}): ${#names[@]} repo(s) stopped mid-job${names[*]:+: ${names[*]}}; repos not started were not maintained."
+    else
+        _live_finish
+    fi
     exit "$code"
 }
 
 # _par_run JOBS IDX... — runs _PAR_KIND's job for the repos REPO_LIST[IDX],
-# JOBS at a time, printing and counting each in order. Polled, not 'wait -n':
-# that needs bash 4.3 and cannot say which job ended before 5.1.
+# JOBS at a time, printing and counting each in order.
 _par_run() {
-    local jobs="$1"; shift
-    _PAR_TG=("$@"); _PAR_PID=(); _PAR_STATE=()
-    local n=$# k rc running=0 printed=0 progress rcs=()
+    local jobs="$1" k; shift
+    _PAR_TG=("$@"); _PAR_PID=(); _PAR_STATE=(); _PAR_N=$#; _PAR_DONE=0
+    _PAR_T0=(); _PAR_PH=(); _PAR_LS=(); _PAR_LN=()
     _PAR_DIR="$(mktemp -d "${TMPDIR:-/tmp}/astromech.XXXXXX")" \
-        || error_exit "cannot create a directory for the jobs' output under ${TMPDIR:-/tmp} (run with --jobs 1)"
-    trap '_par_cleanup; _release_lock' EXIT
-    trap '_par_abort INT' INT; trap '_par_abort TERM' TERM; trap '_par_abort HUP' HUP
-    # One stream or two: what --jobs 1 writes to a shared terminal or file
-    # interleaves stdout with stderr, and has to come back that way.
-    _PAR_SAME=0; [[ /dev/fd/1 -ef /dev/fd/2 ]] && _PAR_SAME=1
-    if [[ "$_PAR_KIND" == maintain ]]; then
-        export GIT_TERMINAL_PROMPT=0
-        info "Up to ${jobs} repos at a time (--jobs 1 for one at a time). Nothing may prompt: GIT_TERMINAL_PROMPT=0 and ssh -o BatchMode=yes, so credentials must come from ssh-agent or a credential helper."
-        if [[ -n "${GIT_SSH:-}" && -z "${GIT_SSH_COMMAND:-}" ]]; then
-            warn "GIT_SSH is set (${GIT_SSH}): a program, so BatchMode cannot be added to it - it must not prompt either. GIT_SSH_COMMAND would let astromech add it."
-        fi
-    fi
-    for (( k = 0; k < n; k++ )); do _PAR_STATE[k]=0; done
+        || error_exit "cannot create a directory for each repo's output under ${TMPDIR:-/tmp}"
+    for (( k = 0; k < _PAR_N; k++ )); do _PAR_STATE[k]=0; done
+    _names_init "$@"
+    if (( jobs > 1 )); then _par_parallel "$jobs"; else _par_sequential; fi
+    _par_cleanup
+}
 
-    while (( printed < n )); do
+# One at a time, in this process, as before item 238: a job of its own would
+# have to give up the terminal, and with --jobs 1 a passphrase may still be
+# typed. The output is buffered and printed exactly as the jobs' is; on a
+# terminal the repo being worked on is one line, rewritten as it goes.
+_par_sequential() {
+    local k d="$_PAR_DIR"
+    (( _LIVE )) && _LIVE_LINE=1
+    for (( k = 0; k < _PAR_N; k++ )); do
+        _PAR_STATE[k]=1; _PAR_T0[k]=$SECONDS; _PAR_CUR=$k
+        (( _LIVE_LINE )) && _live_running "$k" ""
+        _par_body "$k" >"${d}/${k}.out" 2>"${d}/${k}.err"
+        _PAR_STATE[k]=2
+        _par_flush "$k" 0
+        _PAR_DONE=$(( k + 1 ))
+    done
+    _LIVE_LINE=0
+    return 0
+}
+
+# Polled, not 'wait -n': that needs bash 4.3 and cannot say which job ended
+# before 5.1.
+_par_parallel() {
+    local jobs="$1" n="$_PAR_N" k rc running=0 progress rcs=()
+    trap '_par_abort INT' INT; trap '_par_abort TERM' TERM; trap '_par_abort HUP' HUP
+    if (( _LIVE )); then _LIVE_BLOCK=1; _LIVE_HID=1; printf '\033[?25l' >&"$_LIVE_FD"; fi
+    while (( _PAR_DONE < n )); do
         progress=0
-        for (( k = printed; k < n; k++ )); do
+        for (( k = _PAR_DONE; k < n; k++ )); do
             (( _PAR_STATE[k] == 1 )) || continue
             kill -0 "${_PAR_PID[k]}" 2>/dev/null && continue
             rc=0; wait "${_PAR_PID[k]}" || rc=$?
             _PAR_STATE[k]=2; rcs[k]=$rc; running=$(( running - 1 )); progress=1
+            (( _LIVE_BLOCK )) && _par_cache "$k" "$rc"
         done
-        for (( k = printed; k < n && running < jobs; k++ )); do
+        for (( k = _PAR_DONE; k < n && running < jobs; k++ )); do
             (( _PAR_STATE[k] == 0 )) || continue
             [[ "$_PAR_KIND" == maintain ]] && _par_conflict "$k" && continue
             _par_spawn "$k"; running=$(( running + 1 )); progress=1
         done
-        while (( printed < n )) && (( _PAR_STATE[printed] == 2 )); do
-            _par_flush "$printed" "${rcs[printed]}"
-            printed=$(( printed + 1 )); progress=1
+        while (( _PAR_DONE < n )) && (( _PAR_STATE[_PAR_DONE] == 2 )); do
+            _par_flush "$_PAR_DONE" "${rcs[_PAR_DONE]}"
+            _PAR_DONE=$(( _PAR_DONE + 1 )); progress=1
         done
+        (( _LIVE_BLOCK )) && _live_frame
         (( progress )) || sleep 0.1
     done
+    _live_finish
     trap - INT TERM HUP
-    _par_cleanup
     return 0
+}
+
+# -----------------------------------------------------------------------------
+# One line per repo (Kamino item 240)
+# -----------------------------------------------------------------------------
+#
+# Not on a terminal (cron, a pipe, a front-end capturing it): each repo's line
+# is printed once, when it and every repo before it are done, behind the log's
+# timestamp - no escape sequences. On a terminal (stderr is one and TERM is not
+# dumb) the lines being worked on are drawn live: with several jobs, a block of
+# the repos not yet printed under the finished ones, redrawn in place with a
+# spinner and the seconds each has been running; with --jobs 1, the one repo's
+# line rewritten as its steps go (no ticking clock there: git may be asking
+# for a passphrase on that very line). A repo's line is cut to the terminal's
+# width, never wrapped - a wrapped line would throw the redraw off - and the
+# block is never taller than the terminal, the rest summed up as "… N more".
+# The summary below holds every skip and failure in full.
+
+_LIVE=0; _LIVE_BLOCK=0; _LIVE_LINE=0; _LIVE_N=0; _LIVE_OPEN=0; _LIVE_HID=0
+_LIVE_FD=2; _LIVE_COLS=80; _LIVE_ROWS=24; _LIVE_RESIZE=0; _LIVE_TICK=0; _LIVE_UTF=0
+_LIVE_ELL="..."; _SPIN=('-' '\' '|' '/'); _SYM_Q="."; _SYM_OK="+"; _SYM_SK="-"; _SYM_F="x"; _SYM_X="!"
+_SYM=""; _COL=""; _ROW=""; _FIT=""
+
+_live_init() {
+    _LIVE=0
+    [[ -t 2 && -n "${TERM:-}" && "${TERM}" != dumb ]] || return 0
+    _LIVE=1
+    exec {_LIVE_FD}>&2
+    # A multibyte character counts as one only in a UTF-8 locale; elsewhere
+    # the symbols are ASCII and cutting a line cannot split one.
+    local probe="→"
+    if (( ${#probe} == 1 )); then
+        _LIVE_UTF=1; _LIVE_ELL="…"; _SPIN=(⠋ ⠙ ⠹ ⠸ ⠼ ⠴ ⠦ ⠧ ⠇ ⠏)
+        _SYM_Q="·"; _SYM_OK="✓"; _SYM_SK="–"; _SYM_F="✗"; _SYM_X="!"
+    fi
+    _live_size
+    trap '_LIVE_RESIZE=1' WINCH
+    return 0
+}
+
+# The terminal's size: stty on stderr (the terminal being drawn on), else
+# $COLUMNS/$LINES, else 80x24 - a pty nobody sized reports 0 0.
+_live_size() {
+    local s="" r="" c=""
+    s="$(stty size <&2 2>/dev/null)" || s=""
+    read -r r c <<<"$s" || true
+    [[ "$c" =~ ^[0-9]+$ ]] && (( c > 0 )) || c="${COLUMNS:-80}"
+    [[ "$r" =~ ^[0-9]+$ ]] && (( r > 0 )) || r="${LINES:-24}"
+    [[ "$c" =~ ^[0-9]+$ ]] || c=80
+    [[ "$r" =~ ^[0-9]+$ ]] || r=24
+    _LIVE_COLS=$c; _LIVE_ROWS=$r; _LIVE_RESIZE=0
+}
+
+# _live_fit TEXT — TEXT cut to one column less than the terminal, into _FIT.
+_live_fit() {
+    local t="$1" max=$(( _LIVE_COLS - 1 ))
+    (( max >= 1 )) || max=1
+    if (( ${#t} > max )); then
+        t="${t:0:max-1}"
+        if (( ! _LIVE_UTF )); then
+            # Bytes, here: never end on part of a character.
+            while [[ "$t" == *[$'\x80'-$'\xff'] ]]; do t="${t%?}"; done
+        fi
+        t+="$_LIVE_ELL"
+    fi
+    _FIT="$t"
+}
+
+_state_style() {
+    case "$1" in
+        ok|planned)     _SYM="$_SYM_OK"; _COL="$C_G" ;;
+        skipped)        _SYM="$_SYM_SK"; _COL="$C_Y" ;;
+        FAILED|refused) _SYM="$_SYM_F";  _COL="$C_R" ;;
+        stopped)        _SYM="$_SYM_X";  _COL="$C_R" ;;
+        *)              _SYM="$_SYM_Q";  _COL="" ;;
+    esac
+}
+
+# _names_init IDX... — each repo's name on its line: its path under its root,
+# or under ~ when the repos come from more than one root.
+_names_init() {
+    local i r="" one=1 nm
+    _NAME=(); _NAMEW=0
+    for i in "$@"; do
+        [[ -n "$r" ]] || r="${REPO_ROOT[$i]}"
+        [[ "${REPO_ROOT[$i]}" == "$r" ]] || one=0
+    done
+    for i in "$@"; do
+        if (( one )); then
+            nm="${REPO_LIST[$i]#"${REPO_ROOT[$i]}"/}"
+            [[ "${REPO_LIST[$i]}" == "${REPO_ROOT[$i]}" ]] && nm="."
+        else
+            nm="${REPO_LIST[$i]/#$HOME/\~}"
+        fi
+        _NAME[i]="$nm"
+        (( ${#nm} <= _NAMEW )) || _NAMEW=${#nm}
+    done
+    (( _NAMEW <= 40 )) || _NAMEW=40
+    return 0
+}
+
+# _row I STATE NOTE SYMBOL COLOUR FIT — repo I's line, into _ROW. Elsewhere
+# than a terminal, "<timestamp> name  state: note"; on one, "  S name  state:
+# note" with the symbol and the state coloured, cut to the width when FIT.
+_row() {
+    local nm="${_NAME[$1]}" st="$2" note="$3" sym="$4" col="$5" pre t off
+    printf -v pre '%-*s' "$_NAMEW" "$nm"
+    t="${pre}  ${st}${note:+: ${note}}"
+    if (( ! _LIVE )); then _ROW="$(_pfx)${t}"; return 0; fi
+    t="  ${sym} ${t}"
+    if (( $6 )); then _live_fit "$t"; t="$_FIT"; fi
+    off=$(( 4 + ${#pre} + 2 ))
+    _ROW="${t:0:2}${col}${t:2:1}${C_N}${t:3:$(( off - 3 ))}${col}${t:off:${#st}}${C_N}${t:$(( off + ${#st} ))}"
+}
+
+# _live_running K [PHASE] — --jobs 1 on a terminal: repo K's line, in place.
+_live_running() {
+    local k="$1"
+    (( _LIVE_RESIZE )) && _live_size
+    if [[ -n "${2:-}" ]]; then _PAR_PH[k]="$2"; fi
+    _row "${_PAR_TG[$k]}" "${_PAR_PH[k]:-$_PH0}${_LIVE_ELL}" "" "${_SPIN[0]}" "$C_C" 1
+    printf '\r\033[2K%s' "$_ROW" >&"$_LIVE_FD"
+    _LIVE_OPEN=1
+}
+
+# _live_row K — job K's line in the block, into _ROW.
+_live_row() {
+    local k="$1" ph=""
+    case "${_PAR_STATE[k]}" in
+        0) _row "${_PAR_TG[$k]}" queued "" "$_SYM_Q" "" 1 ;;
+        1)
+            if [[ -f "${_PAR_DIR}/${k}.phase" ]]; then IFS= read -r ph < "${_PAR_DIR}/${k}.phase" || true; fi
+            [[ -z "$ph" ]] || _PAR_PH[k]="$ph"
+            _row "${_PAR_TG[$k]}" "${_PAR_PH[k]:-$_PH0}${_LIVE_ELL} $(( SECONDS - _PAR_T0[k] ))s" "" \
+                "${_SPIN[_LIVE_TICK % ${#_SPIN[@]}]}" "$C_C" 1 ;;
+        *)
+            _state_style "${_PAR_LS[k]:-}"
+            _row "${_PAR_TG[$k]}" "${_PAR_LS[k]:-}" "${_PAR_LN[k]:-}" "$_SYM" "$_COL" 1 ;;
+    esac
+}
+
+# _live_frame — redraws the block (every repo not yet printed) in place.
+_live_frame() {
+    local k n="$_PAR_N" cap shown=0 out=""
+    (( _LIVE_RESIZE )) && _live_size
+    _LIVE_TICK=$(( _LIVE_TICK + 1 ))
+    (( _LIVE_N == 0 )) || out+=$'\033['"${_LIVE_N}"'A'
+    out+=$'\r'
+    cap=$(( _LIVE_ROWS - 2 )); (( cap >= 1 )) || cap=1
+    for (( k = _PAR_DONE; k < n; k++ )); do
+        if (( n - _PAR_DONE > cap && shown == cap - 1 )); then
+            _live_fit "  ${_LIVE_ELL} $(( n - k )) more"
+            out+=$'\033[2K'"$_FIT"$'\n'; shown=$(( shown + 1 ))
+            break
+        fi
+        _live_row "$k"
+        out+=$'\033[2K'"$_ROW"$'\n'; shown=$(( shown + 1 ))
+    done
+    out+=$'\033[J'
+    printf '%s' "$out" >&"$_LIVE_FD"
+    _LIVE_N=$shown
+}
+
+# _live_clear — removes the block; the cursor is left where it began.
+_live_clear() {
+    (( _LIVE_N == 0 )) || printf '\033[%dA' "$_LIVE_N" >&"$_LIVE_FD"
+    printf '\r\033[J' >&"$_LIVE_FD"
+    _LIVE_N=0
+}
+
+# _live_finish — the block is done with: cleared, the cursor shown again.
+_live_finish() {
+    if (( _LIVE_BLOCK )); then _live_clear; _LIVE_BLOCK=0; fi
+    if (( _LIVE_HID )); then printf '\033[?25h' >&"$_LIVE_FD"; _LIVE_HID=0; fi
+    return 0
+}
+
+# _live_restore — on exit, whatever way it comes: a line left open (--jobs 1
+# stopped mid-repo) is closed saying so, the cursor is shown.
+_live_restore() {
+    (( _LIVE )) || return 0
+    if (( _LIVE_OPEN )); then
+        if (( _LIVE_LINE )) && [[ "$_PAR_KIND" == maintain ]]; then
+            _state_style stopped
+            _row "${_PAR_TG[$_PAR_CUR]}" stopped "interrupted — this repo may be mid-step; look at it with git status" "$_SYM" "$_COL" 1
+            printf '\r\033[2K%s\n' "$_ROW" >&"$_LIVE_FD"
+        elif (( _LIVE_LINE )); then
+            printf '\r\033[2K' >&"$_LIVE_FD"
+        else
+            printf '\n' >&"$_LIVE_FD"
+        fi
+        _LIVE_OPEN=0
+    fi
+    _live_finish
 }
 
 # -----------------------------------------------------------------------------
@@ -1248,7 +1561,7 @@ _tidy_apply() {
 
 cmd_tidy() {
     _run_lock || error_exit "another ${SCRIPT_NAME} run is in progress (lock: $(_lock_path)). Wait for it, or remove the lock if you are sure it is dead."
-    trap '_release_lock' EXIT
+    trap '_on_exit' EXIT
     load_config
     (( ${#ROOTS[@]} )) || error_exit "No roots configured. Add one: ${SCRIPT_NAME}.sh add-root PATH"
     discover
@@ -1527,17 +1840,9 @@ cmd_status() {
     SR_E=(); SR_K=(); SR_NS=(); SR_NP=(); SR_LB=()
     if (( ${#all[@]} )); then
         jobs="$(_jobs)"; (( jobs <= ${#all[@]} )) || jobs=${#all[@]}
-        _PAR_KIND=status
-        if (( jobs > 1 )); then _par_run "$jobs" "${all[@]}"
-        else
-            local k
-            _PAR_TG=("${all[@]}")
-            _PAR_DIR="$(mktemp -d "${TMPDIR:-/tmp}/astromech.XXXXXX")" \
-                || error_exit "cannot create a directory for each repo's rows under ${TMPDIR:-/tmp}"
-            trap '_par_cleanup' EXIT
-            for k in "${!_PAR_TG[@]}"; do _status_body "$k"; _flush_status "$k" 0; done
-            _par_cleanup
-        fi
+        trap '_on_exit' EXIT
+        _PAR_KIND=status _PH0=reading
+        _par_run "$jobs" "${all[@]}"
     fi
     local root i entries=() kids=() n k last cont line idx any_stash=0
     local total=0 repos_with=0 any_local_base=0

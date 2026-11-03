@@ -26,7 +26,7 @@ conflict stays stopped, so whoever ran maintenance can resolve it
 
 Up to four repos are maintained at once (`--jobs N`, see
 [Parallel runs](#parallel-runs)); the report still reads one repo after
-another, in order.
+another, in order, one line each (see [Output](#output)).
 
 These repos are **skipped and reported**, never touched:
 
@@ -198,6 +198,42 @@ Otherwise that's a thing you find out by wondering why one repo never prunes.
 remote no longer has, which is a much bigger promise than dropping a stale
 branch ref, and nothing here needs it.
 
+## Output
+
+Each repo is one line: its path under the root (under `~` when the run spans
+several roots), then `ok:` and what was done, `skipped:` and why, or `FAILED:`
+and why. Unattended - cron, a pipe, a front-end reading it - a line is printed
+when its repo and every repo before it are done, in repo order, behind the
+log's timestamp, with no escape sequences:
+
+```console
+2026-11-03T08:00:04Z [info]  Maintaining 6 repo(s)…
+2026-11-03T08:00:06Z a-feature   ok: committed 'feature', feature → main, pulled
+2026-11-03T08:00:06Z b-stash     ok: stashed, pulled
+2026-11-03T08:00:06Z c-detached  skipped: detached HEAD
+2026-11-03T08:00:06Z d-hook      FAILED: commit on 'feature' failed (hook? identity?) — nothing changed
+          hook says no
+2026-11-03T08:00:07Z e-tidy      ok: pulled, 2 branches deleted, 1 refused
+          error: The branch 'stale' is not fully merged.
+          If you are sure you want to delete it, run 'git branch -D stale'.
+2026-11-03T08:00:07Z f-behind    ok: pulled, 1 branch deleted
+```
+
+Under a line goes only what explains it: git's own output when the repo
+failed or tidy was refused, or a warning. The steps themselves (committed,
+checked out, stashed, deleted) come with `--verbose`, under each repo's line.
+The summary that follows is unchanged, every skip and failure in it in full.
+
+On a terminal (stderr is one and `TERM` is not `dumb`) the same lines are drawn
+live: finished repos above, and below them a block of the ones still to come,
+redrawn in place - `queued`, or what each is doing (`pulling… 12s`, with a
+spinner) - until each turns into its final line. With `--jobs 1` the one repo
+being worked on is a line rewritten as its steps go (no clock there: git may be
+asking for a passphrase on it). Lines are cut to the terminal's width, never
+wrapped, and a block taller than the terminal ends in `… N more`. Ctrl-C leaves
+every repo's line saying what became of it (`stopped`, `not started`) and the
+cursor visible.
+
 ## Parallel runs
 
 A pull waits on the network, so one repo at a time made a run as long as the
@@ -209,7 +245,7 @@ from GitHub over ssh, 49-109 s one at a time became 16 s with four jobs and
 
 - **The same report.** Each repo's whole job (maintain, then its tidy with
   `--tidy`) runs in the background with its output held back; a repo is
-  printed as soon as it and every repo before it are done. The sections, the
+  printed as soon as it and every repo before it are done. The lines, the
   summary and the exit status are byte for byte those of `--jobs 1`, and one
   extra line says how many run at once. With stdout and stderr on different
   files each keeps its own stream.
@@ -228,8 +264,8 @@ from GitHub over ssh, 49-109 s one at a time became 16 s with four jobs and
   shell error, a signal — is reported `FAILED` for its repo; the others are
   maintained and counted as usual.
 - **Ctrl-C** (or TERM, HUP) stops every job and every git under it, prints
-  what the started repos reported, names the ones stopped mid-job, releases
-  the run lock and exits 130 (143, 129).
+  each started repo's line (`stopped` for the ones stopped mid-job, which the
+  closing warning names), releases the run lock and exits 130 (143, 129).
 
 A single repo (`--repo`, or only one discovered) always runs the old way.
 
@@ -374,10 +410,11 @@ are what the skip conditions below depend on.
 | `test-trunks-worktrees.sh` | 47 | long-lived branches: never tidied, never wip-committed by `maintain`; linked worktrees (one stray outside every root is named); a branch rebased or bisected elsewhere; deepest-root attribution; `status` taking no optional locks |
 | `test-locked.sh` | 17 | the run lock: a stale one whose holder is gone, one path whatever the environment, never visible without its pid |
 | `test-default-branch.sh` | 10 | which branch is the trunk, in the orders that matter |
-| `test-jobs.sh` | 58 | `--jobs`: the same report as one at a time, totals that add up, nested git dirs never at once, prompts that fail instead of hanging, a crashed job, Ctrl-C/TERM releasing the lock |
+| `test-jobs.sh` | 73 | `--jobs`: the same report as one at a time, totals that add up, nested git dirs never at once, prompts that fail instead of hanging, a crashed job, Ctrl-C/TERM releasing the lock; one line per repo off a terminal, exactly (golden), in order, `--verbose` restoring the steps |
+| `test-live.sh` | 35 | the live block under a real terminal, read back through a small terminal emulator: lines updated in place and left in their final state, `--jobs 1`'s rewritten line, a narrow and short terminal (cut, never wrapped; `… N more`), TERM interrupting it (readable block, cursor back), `TERM=dumb` |
 | `test-reads.sh` | 17 | fewer git calls, same answers: `status` and `tidy --dry-run` byte for byte the previous engine's over a tree of awkward states (detached, mid-rebase, a stale `origin/HEAD`, a tag named like the branch, an unborn branch, no origin), with `--jobs 1` and `4`; calls counted through a `git` wrapper |
 
-**334 checks** in total.
+**384 checks** in total.
 
 `test-prune.sh` writes to a global git config, so it first proves git honours
 `$GIT_CONFIG_GLOBAL` (2.32+) and skips itself if not — the real `~/.gitconfig`
@@ -389,6 +426,8 @@ helper stand in for a prompt nobody answers, and a stub `date` makes one job
 crash. Its credential check needs python's `pty` (a terminal on stdin is the
 only case in which one-at-a-time maintenance would prompt) and its Ctrl-C
 check needs `perl`; each is skipped, not failed, without them.
+
+`test-live.sh` needs python's `pty` too, and skips itself without it.
 
 `test-tidy.sh` needs `setsid` to observe the confirmation gate refusing with no
 controlling terminal, and python's `pty` to answer the question with one. It
