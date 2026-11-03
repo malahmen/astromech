@@ -166,6 +166,12 @@ n=$(calls tidy --dry-run --jobs 1)
 check "tidy's plan: 2 per plain repo (${n} for 6)"                    [ "$n" -le 12 ]
 n=$(calls maintain --dry-run --jobs 1)
 check "maintain --dry-run: 4 per plain repo, its stash count included (${n} for 6)" [ "$n" -le 24 ]
+# And read side by side: with every `git status` taking a second, six repos
+# take six seconds one at a time and two or three with --jobs 4.
+printf '#!/bin/sh\n[ "$3" = status ] && sleep 1\nexec "%s" "$@"\n' "$realgit" > "$T/gw/git"
+t0=$(date +%s); PATH="$T/gw:$PATH" bash "$AM" status --jobs 4 >/dev/null 2>&1; t1=$(date +%s)
+check "status --jobs 4 reads repos at once ($((t1 - t0))s for six 1-second reads)" [ $((t1 - t0)) -lt 5 ]
+printf '#!/bin/sh\n[ "$1" = -C ] && echo "$*" >> "%s/calls"\nexec "%s" "$@"\n' "$T" "$realgit" > "$T/gw/git"
 export ASTROMECH_CONFIG="$T/c.conf"
 n=$(calls status --jobs 1)
 # Busier repos cost more (a worktree list and a --merged per repo with

@@ -420,9 +420,9 @@ are what the skip conditions below depend on.
 | `test-default-branch.sh` | 10 | which branch is the trunk, in the orders that matter |
 | `test-jobs.sh` | 73 | `--jobs`: the same report as one at a time, totals that add up, nested git dirs never at once, prompts that fail instead of hanging, a crashed job, Ctrl-C/TERM releasing the lock; one line per repo off a terminal, exactly (golden), in order, `--verbose` restoring the steps |
 | `test-live.sh` | 43 | the live block under a real terminal, read back through a small terminal emulator: lines updated in place and left in their final state, `--jobs 1`'s rewritten line, a narrow and short terminal (cut, never wrapped; `… N more`), TERM interrupting it (readable block, cursor back), `TERM=dumb`; `tidy` planning live, asking once, one line per repo deleted in |
-| `test-reads.sh` | 23 | fewer git calls, same answers: `status` and `tidy --dry-run` byte for byte the previous engine's over a tree of awkward states (detached, mid-rebase, a stale `origin/HEAD`, a tag named like the branch, an unborn branch, no origin), with `--jobs 1` and `4`; calls counted through a `git` wrapper; `tidy --yes`'s one line per repo |
+| `test-reads.sh` | 24 | fewer git calls, same answers: `status` and `tidy --dry-run` byte for byte the previous engine's over a tree of awkward states (detached, mid-rebase, a stale `origin/HEAD`, a tag named like the branch, an unborn branch, no origin), with `--jobs 1` and `4`; calls counted through a `git` wrapper; `tidy --yes`'s one line per repo |
 
-**398 checks** in total.
+**399 checks** in total.
 
 `test-prune.sh` writes to a global git config, so it first proves git honours
 `$GIT_CONFIG_GLOBAL` (2.32+) and skips itself if not — the real `~/.gitconfig`
