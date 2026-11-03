@@ -175,7 +175,8 @@ run repos
 check "a repo under the inner root is listed once" test "$(grep -c "/inner/nested$" <<<"$OUT")" -eq 1
 check "...under the inner root"                    has "$T/outer/inner"$'\t'"$T/outer/inner/nested" "$OUT"
 run maintain --dry-run --repo "$T/outer/inner/nested"
-check "maintain heads it with the inner root"      has "nested  ($T/outer/inner)" "$ERR"
+# Its line names it under the inner root: "nested", not "inner/nested".
+check "maintain names it under the inner root"     grep -qE '(^|Z )nested +ok: ' <<<"$ERR"
 bash "$AM" remove-root "$T/outer" "$T/outer/inner" >/dev/null 2>&1
 
 # GIT_OPTIONAL_LOCKS: status is read-only, so every git it runs must take no
