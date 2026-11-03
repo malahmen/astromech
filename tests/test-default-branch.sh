@@ -35,12 +35,14 @@ mkrepo() {
     git -C "$dst" push -q origin "$b"
 }
 # default <repo> — what the engine resolves, read through a sourced copy so the
-# function is tested rather than inferred from behaviour.
+# function is tested rather than inferred from behaviour. Since Kamino item
+# 239 it reads the refs from a snapshot (_snap), which is sourced with it.
 default() {
     bash -c '
         set -uo pipefail
+        declare -A RGD=()
         _current_branch() { git -C "$1" symbolic-ref --short -q HEAD 2>/dev/null; }
-        eval "$(sed -n "/^_default_branch() {/,/^}/p" "$1")"
+        for f in _snap _has_ref _default_branch; do eval "$(sed -n "/^${f}() {/,/^}/p" "$1")"; done
         _default_branch "$2"; printf "|rc=%s" "$?"
     ' _ "$AM" "$1"
 }
@@ -88,8 +90,9 @@ mkrepo "$R/odd" develop
 git -C "$R/odd" symbolic-ref -d refs/remotes/origin/HEAD 2>/dev/null || true
 check "no trunk is an error, not a guess"    bash -c "[ \"\$(bash -c '
         set -uo pipefail
+        declare -A RGD=()
         _current_branch() { git -C \"\$1\" symbolic-ref --short -q HEAD 2>/dev/null; }
-        eval \"\$(sed -n \"/^_default_branch() {/,/^}/p\" \"\$1\")\"
+        for f in _snap _has_ref _default_branch; do eval \"\$(sed -n \"/^\${f}() {/,/^}/p\" \"\$1\")\"; done
         _default_branch \"\$2\" >/dev/null; printf \"rc=%s\" \"\$?\"
     ' _ '$AM' '$R/odd')\" = 'rc=1' ]"
 

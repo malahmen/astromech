@@ -233,6 +233,15 @@ from GitHub over ssh, 49-109 s one at a time became 16 s with four jobs and
 
 A single repo (`--repo`, or only one discovered) always runs the old way.
 
+`status` reads its repos with the same runner and `--jobs` (no lock and no
+network there, so none of the rules above apply), and prints the same tree.
+Each repo now costs three git calls in the common case - one `rev-parse` at
+discovery for its git dir, common dir and work tree, then one `status
+--porcelain=v2 --branch` and one `for-each-ref` for its branch, dirt, trunk,
+stash and branches - where it took fifteen; `maintain` and `tidy` read through
+the same functions. On 18 repos, `status` went from 9.5 s to 2.5 s one at a
+time and 1.6-2 s with four jobs.
+
 ## Front-end
 
 The interactive experience (first-run setup, multi-select ignore picker, menu)
@@ -310,7 +319,7 @@ root=/Users/me/work
 ignore=/Users/me/code/archive
 ```
 
-`jobs=` (1-64, optional) is `maintain`'s default for `--jobs`; the flag wins.
+`jobs=` (1-64, optional) is the default for `--jobs` (`maintain`, `status`); the flag wins.
 astromech never writes it, only keeps it; a value that is not a number in range
 is named in a warning and the default of 4 used.
 
@@ -366,8 +375,9 @@ are what the skip conditions below depend on.
 | `test-locked.sh` | 17 | the run lock: a stale one whose holder is gone, one path whatever the environment, never visible without its pid |
 | `test-default-branch.sh` | 10 | which branch is the trunk, in the orders that matter |
 | `test-jobs.sh` | 58 | `--jobs`: the same report as one at a time, totals that add up, nested git dirs never at once, prompts that fail instead of hanging, a crashed job, Ctrl-C/TERM releasing the lock |
+| `test-reads.sh` | 17 | fewer git calls, same answers: `status` and `tidy --dry-run` byte for byte the previous engine's over a tree of awkward states (detached, mid-rebase, a stale `origin/HEAD`, a tag named like the branch, an unborn branch, no origin), with `--jobs 1` and `4`; calls counted through a `git` wrapper |
 
-**317 checks** in total.
+**334 checks** in total.
 
 `test-prune.sh` writes to a global git config, so it first proves git honours
 `$GIT_CONFIG_GLOBAL` (2.32+) and skips itself if not — the real `~/.gitconfig`
