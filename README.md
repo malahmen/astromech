@@ -81,6 +81,14 @@ branches already contained in their trunk — these would be deleted:
 Delete 3 merged branch(es)? [y/N]
 ```
 
+The repos are planned `--jobs` at a time (default 4) and the plan printed in
+repo order, the same as one by one. On a terminal the repos being planned are
+drawn live, and that block gives way to the plan; the deletions then show one
+line per repo, rewritten as they go (`ok: deleted fix/x (was 1a2b3c4), …`, or
+`refused:` naming what git would not delete). Off a terminal planning prints
+nothing of its own - the plan is its record - and each repo deleted in is one
+such line.
+
 Two things make it safe rather than merely careful:
 
 - **"Merged" means contained in `origin/<trunk>`, not the local one.** A local
@@ -311,9 +319,9 @@ astromech.sh --help
 | Command | Does |
 | --- | --- |
 | `maintain` | run maintenance on every discovered repo (`--repo`, `--dry-run`, `--tidy`, `--jobs N`) |
-| `tidy` | list local branches already merged into the trunk, then delete them (`--repo`, `--dry-run`, `--yes`) |
+| `tidy` | list local branches already merged into the trunk, then delete them (`--repo`, `--dry-run`, `--yes`, `--jobs N`) |
 | `prune [on\|off]` | show or toggle git's `fetch.prune`, with what it does and does not prune, and any repo overriding it (`--dry-run`) |
-| `status` | per root: repos (relative path, branch, `*` if dirty), the branches `tidy` would delete, and ignored folders |
+| `status` | per root: repos (relative path, branch, `*` if dirty), the branches `tidy` would delete, and ignored folders (`--jobs N`) |
 | `roots` / `add-root PATH…` / `remove-root PATH…` | manage roots (`add-root` prints each newly added absolute path; removing one also drops its ignores) |
 | `children ROOT` | ROOT's top-level folders as TSV `name<TAB>ignored(0\|1)` |
 | `ignores` / `set-ignores ROOT [NAME…]` | list / replace a root's ignored top-level folders |
@@ -355,7 +363,7 @@ root=/Users/me/work
 ignore=/Users/me/code/archive
 ```
 
-`jobs=` (1-64, optional) is the default for `--jobs` (`maintain`, `status`); the flag wins.
+`jobs=` (1-64, optional) is the default for `--jobs` (`maintain`, `tidy`, `status`); the flag wins.
 astromech never writes it, only keeps it; a value that is not a number in range
 is named in a warning and the default of 4 used.
 
@@ -411,10 +419,10 @@ are what the skip conditions below depend on.
 | `test-locked.sh` | 17 | the run lock: a stale one whose holder is gone, one path whatever the environment, never visible without its pid |
 | `test-default-branch.sh` | 10 | which branch is the trunk, in the orders that matter |
 | `test-jobs.sh` | 73 | `--jobs`: the same report as one at a time, totals that add up, nested git dirs never at once, prompts that fail instead of hanging, a crashed job, Ctrl-C/TERM releasing the lock; one line per repo off a terminal, exactly (golden), in order, `--verbose` restoring the steps |
-| `test-live.sh` | 35 | the live block under a real terminal, read back through a small terminal emulator: lines updated in place and left in their final state, `--jobs 1`'s rewritten line, a narrow and short terminal (cut, never wrapped; `… N more`), TERM interrupting it (readable block, cursor back), `TERM=dumb` |
-| `test-reads.sh` | 17 | fewer git calls, same answers: `status` and `tidy --dry-run` byte for byte the previous engine's over a tree of awkward states (detached, mid-rebase, a stale `origin/HEAD`, a tag named like the branch, an unborn branch, no origin), with `--jobs 1` and `4`; calls counted through a `git` wrapper |
+| `test-live.sh` | 43 | the live block under a real terminal, read back through a small terminal emulator: lines updated in place and left in their final state, `--jobs 1`'s rewritten line, a narrow and short terminal (cut, never wrapped; `… N more`), TERM interrupting it (readable block, cursor back), `TERM=dumb`; `tidy` planning live, asking once, one line per repo deleted in |
+| `test-reads.sh` | 23 | fewer git calls, same answers: `status` and `tidy --dry-run` byte for byte the previous engine's over a tree of awkward states (detached, mid-rebase, a stale `origin/HEAD`, a tag named like the branch, an unborn branch, no origin), with `--jobs 1` and `4`; calls counted through a `git` wrapper; `tidy --yes`'s one line per repo |
 
-**384 checks** in total.
+**398 checks** in total.
 
 `test-prune.sh` writes to a global git config, so it first proves git honours
 `$GIT_CONFIG_GLOBAL` (2.32+) and skips itself if not — the real `~/.gitconfig`

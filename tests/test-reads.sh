@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# Fewer git calls, same answers (Kamino item 239): status, tidy's plan and
-# maintain read each repository with one rev-parse (discovery), one
-# for-each-ref and - where the dirty state is needed - one status, and status
-# builds its rows with the job runner. What they print must not change by a
+# Fewer git calls, same answers (Kamino item 239; section 4 is item 241's):
+# status, tidy's plan and maintain read each repository with one rev-parse
+# (discovery), one for-each-ref and - where the dirty state is needed - one
+# status, and status and tidy build their rows and plan with the job runner. What they print must not change by a
 # byte, with --jobs 1 or 4, so the expected output below is the previous
 # engine's (main at a814128, run on this very fixture), kept literally; the
 # call counts are what changed.
@@ -175,6 +175,25 @@ check "status over the mixed tree: under 5 a repo (${n} for 12)"     [ "$n" -le 
 printf '#!/bin/sh\n[ "$1" = -C ] && printf "%%s\\n" "${GIT_OPTIONAL_LOCKS-unset}" >> "%s/optlocks"\nexec "%s" "$@"\n' "$T" "$realgit" > "$T/gw/git"
 : > "$T/optlocks"; PATH="$T/gw:$PATH" bash "$AM" status --jobs 4 >/dev/null 2>&1
 check "status's jobs run git with GIT_OPTIONAL_LOCKS=0 only"          bash -c "[ -s '$T/optlocks' ] && [ -z \"\$(grep -vx 0 '$T/optlocks')\" ]"
+
+echo "## 4. tidy deletes with one line per repo (Kamino item 241)"
+# Off a terminal planning prints nothing of its own (the plan is its record);
+# each repo it deletes in is one line, with the shas to get a branch back.
+export ASTROMECH_CONFIG="$T/c.conf"
+bash "$AM" tidy --yes --jobs 4 >"$T/del.out" 2>"$T/del.err"; rc=$?
+EXPECTED_DEL="f-feature  ok: deleted done-f (was aedd84e), done-g (was b201a8a)
+g-tagged   ok: deleted v1 (was e43a138)
+h-flow     ok: deleted feat-h (was c5b0956)
+i-stale    refused: done-i
+j-local    ok: deleted shipped (was f71c9b2)
+l-wt       ok: deleted free-l (was 2a7cbba)"
+out="$(sed -nE 's/^[0-9T:Z-]+ ([a-z]-[a-z]+ +(ok|refused): .*)/\1/p' "$T/del.err")"
+check "one line per repo it deleted in, exactly"         same "$out" "$EXPECTED_DEL"
+check "the plan printed first, as tidy --dry-run's"      same "$(norm < "$T/del.out"; echo x)" "${EXPECTED_PLAN}x"
+check "no other repo lines (planning prints nothing)"    [ "$(grep -cE '^[0-9T:Z-]+ [a-z]-[a-z]+ ' "$T/del.err")" -eq 6 ]
+check "git's refusal under the refused repo's line"      bash -c "grep -A3 -E ' i-stale +refused:' '$T/del.err' | grep -q 'not fully merged'"
+check "the summary and the REFUSED line, as before"      bash -c "grep -q 'Summary: 6 deleted, 1 refused\.' '$T/del.err' && grep -q 'REFUSED  .*/i-stale: done-i (fa33ffb) — git -C .* branch -D done-i  # contained in trunk2' '$T/del.err'"
+check "exit 1: a deletion was refused"                   [ "$rc" -eq 1 ]
 
 echo
 if (( FAILS )); then echo "${FAILS} check(s) failed"; exit 1; fi

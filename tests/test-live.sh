@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# The live block on a terminal (Kamino item 240): maintain draws one line per
-# repo and updates it in place while the jobs run. Run under a real terminal (python's pty), read back
+# The live block on a terminal (Kamino items 240, 241): maintain draws one line
+# per repo and updates it in place while the jobs run; tidy does the same while
+# it plans and deletes. Run under a real terminal (python's pty), read back
 # through a small terminal emulator: what is left on the screen, and every line
 # drawn in place, measured.
 #
@@ -10,7 +11,7 @@
 #     the width, and a block taller than the terminal is summed up;
 #   - interrupted, the block is left saying what became of each repo and the
 #     cursor is visible again;
-#   - TERM=dumb gets the plain lines.
+#   - TERM=dumb gets the plain lines; tidy asks its one question once.
 #
 # No network: file:// remotes, a git stub on PATH to slow or hang a pull.
 set -uo pipefail
@@ -229,6 +230,18 @@ TTERM=dumb PULL_DELAY=0 tty 30 120 -- bash "$AM" maintain --jobs 3
 check "exit 0"                                             [ "$TRC" -eq 0 ]
 check "no cursor movement or line erasing"                 bash -c "! grep -qE \$'\\033\\\\[([0-9]+A|2K|J|\\\\?25)' '$T/raw'"
 check "the lines are the plain ones"                       screen_has "^delta +ok: pulled$"
+
+echo "## 6. tidy: the plan, one question, one line per repo"
+for n in alpha bravo; do git -C "$R/$n" branch "merged-$n" origin/main; done
+tty 30 120 --ans y -- bash "$AM" tidy --jobs 3
+check "exit 0"                                             [ "$TRC" -eq 0 ]
+check "the repos were shown being planned"                 raw_has "planning${E}"
+check "the question was asked once"                        [ "$(grep -o 'Delete [0-9]* merged branch(es)? \[y/N\]' "$T/raw" | wc -l | tr -d ' ')" -eq 1 ]
+check "the plan is on the screen, the planning is not"     bash -c "grep -q 'merged into origin/main' '$T/screen' && ! grep -qE 'planning|queued' '$T/screen'"
+check "one line per repo it deleted in, with the sha"      bash -c "grep -qE '^  . alpha +ok: deleted merged-alpha \(was [0-9a-f]{7}\)$' '$T/screen' && grep -qE '^  . bravo +ok: deleted merged-bravo \(was [0-9a-f]{7}\)$' '$T/screen'"
+check "  and nothing for the repos with nothing to delete" bash -c "! grep -qE '^  . (charlie|foxtrot) ' '$T/screen'"
+check "the summary, as before"                             screen_has "^\[info\]  Summary: 2 deleted, 0 refused\.$"
+check "the cursor is shown"                                [ "$(python3 "$T/screen.py" 120 --cursor < "$T/raw")" = shown ]
 
 echo
 if (( FAILS )); then echo "${FAILS} check(s) failed"; exit 1; fi

@@ -145,11 +145,11 @@ FLAGS
   --repo PATH              maintain, tidy: limit to one discovered repo
   --dry-run                maintain, tidy: report what would happen, change nothing
   --tidy                   maintain: also tidy each repo once its pull has succeeded
-  --jobs N                 maintain, status: repos worked on at once, 1-${JOBS_MAX}
+  --jobs N                 maintain, tidy, status: repos worked on at once, 1-${JOBS_MAX}
                            (default ${JOBS_DEFAULT}, or jobs= in the config); 1 = one at a time
   --dry-run                prune: report the change, write nothing
   -y, --yes                tidy: delete without asking (required when there is no terminal)
-  -v, --verbose            maintain: every repo's steps under its line; debug logging
+  -v, --verbose            maintain, tidy: every repo's steps under its line; debug logging
   -h, --help
 
 Per repo, maintain does:
@@ -834,7 +834,7 @@ _maintain_tally() {
 # from the result, whichever way the repo ran.
 _maintain_body() {
     local k="$1" i="${_PAR_TG[$1]}" ns
-    local TIDY_DELETED=0 TIDY_FAILED=0 TIDY_LINES=() TIDY_PLAN=() TIDY_NOTES=() _NWARN=0
+    local TIDY_DELETED=0 TIDY_FAILED=0 TIDY_LINES=() TIDY_PLAN=() TIDY_NOTES=() TIDY_DONE=() TIDY_REFUSED=() _NWARN=0
     _maintain_one "$i"
     ns="$(_stashes "${REPO_LIST[$i]}")"
     _par_result "$k" "$R_STATUS" "$R_NOTE" "$TIDY_DELETED" "$TIDY_FAILED" "$ns" "$_NWARN" "${#TIDY_PLAN[@]}" "${TIDY_LINES[@]}"
@@ -877,14 +877,14 @@ _flush_maintain() {
 
 # -----------------------------------------------------------------------------
 # The job runner: several repos at once (Kamino item 238), one line each
-# (Kamino item 240)
+# (Kamino items 240, 241)
 # -----------------------------------------------------------------------------
 #
 # A pull is network-bound, so one repo at a time made a run as long as the sum
 # of its pulls. With --jobs N, up to N repos run their whole job at once, each
 # in a background subshell. The runner serves maintain (each repo's
-# maintain_repo and its tidy) and status (each repo's rows), told apart by
-# _PAR_KIND:
+# maintain_repo and its tidy), tidy's planning and its deletions, and status
+# (each repo's rows), told apart by _PAR_KIND:
 #
 #   - a job's output goes to a buffer of its own, and its result to a file - a
 #     subshell cannot set the parent's globals. The parent prints a repo once
@@ -901,8 +901,8 @@ _flush_maintain() {
 #     once. One entry per git dir is already discovery's rule; a submodule's
 #     git dir (inside the superproject's .git/modules) is the nested case,
 #     written by the superproject's own pull too
-#     (fetch.recurseSubmodules=on-demand). Reading (status) has no such
-#     rule;
+#     (fetch.recurseSubmodules=on-demand). Reading (status, tidy's plan) has
+#     no such rule;
 #   - nothing may prompt: no one could answer, and a background job reading the
 #     terminal would stop the run for good. GIT_TERMINAL_PROMPT=0, ssh gets
 #     -o BatchMode=yes, stdin is /dev/null, and SIGTTIN/SIGTTOU are ignored so
@@ -912,7 +912,7 @@ _flush_maintain() {
 #   - each job is its own process group, so Ctrl-C/TERM/HUP stops the jobs and
 #     every git under them, and the EXIT trap still releases the run lock.
 
-_PAR_KIND=""; _PH0=""   # what runs per repo: maintain|status; a job's first phase
+_PAR_KIND=""; _PH0=""   # what runs per repo: maintain|plan|delete|status; a job's first phase
 _PAR_DIR=""; _PAR_TG=(); _PAR_PID=(); _PAR_STATE=()   # 0 waiting, 1 running, 2 done, 3 printed
 _PAR_N=0; _PAR_DONE=0; _PAR_CUR=0; _PAR_T0=(); _PAR_PH=(); _PAR_LS=(); _PAR_LN=()
 _PHASE_FILE=""; _RES=(); _TS=""; _TN=""; _NAME=(); _NAMEW=0
@@ -963,6 +963,8 @@ _res_read() {
 _par_body() {
     case "$_PAR_KIND" in
         maintain) _maintain_body "$1" ;;
+        plan)     _plan_body "$1" ;;
+        delete)   _delete_body "$1" ;;
         status)   _status_body "$1" ;;
     esac
 }
@@ -1025,6 +1027,8 @@ _par_flush() {
     (( _LIVE_BLOCK )) && _live_clear
     case "$_PAR_KIND" in
         maintain) _flush_maintain "$1" "$2" ;;
+        plan)     _flush_plan "$1" "$2" ;;
+        delete)   _flush_delete "$1" "$2" ;;
         status)   _flush_status "$1" "$2" ;;
     esac
     _PAR_STATE[$1]=3
@@ -1037,6 +1041,7 @@ _par_cache() {
     if _res_read "$k"; then
         case "$_PAR_KIND" in
             maintain) _maintain_text ;;
+            plan)     _TS=planned; if (( _RES[0] )); then _TN="$(_nbr "${_RES[0]}") merged"; else _TN="nothing to delete"; fi ;;
             *)        _TS=ok; _TN="" ;;
         esac
     else
@@ -1097,6 +1102,7 @@ _par_abort() {
         warn "interrupted (SIG${sig}): ${#names[@]} repo(s) stopped mid-job${names[*]:+: ${names[*]}}; repos not started were not maintained."
     else
         _live_finish
+        [[ "$_PAR_KIND" == status ]] || warn "interrupted (SIG${sig}) — nothing was deleted."
     fi
     exit "$code"
 }
@@ -1423,6 +1429,7 @@ _busy_branches() {
 TIDY_PLAN=()        # "<repo>\t<branch>\t<base>\t<short sha>", in discovery order
 TIDY_NOTES=()       # repos that could not be planned, and why
 TIDY_DELETED=0; TIDY_FAILED=0; TIDY_LINES=()
+TIDY_DONE=(); TIDY_REFUSED=()   # the last _tidy_apply's: "<branch> (was <sha>)", "<branch>"
 
 # _tidy_plan_repo <repo> — appends one TIDY_PLAN entry per local branch of
 # <repo> that is already contained in its trunk. Reads only: one for-each-ref
@@ -1540,11 +1547,13 @@ _tidy_confirm() {
 # the branch may have moved while the question was open.
 _tidy_apply() {
     local p repo b base sha
+    TIDY_DONE=(); TIDY_REFUSED=()
     for p in "${TIDY_PLAN[@]}"; do
         IFS=$'\t' read -r repo b base _ <<< "$p"
         sha="$(git -C "$repo" rev-parse --short "refs/heads/${b}" 2>/dev/null || echo '?')"
         if _git "$repo" branch -d "$b"; then
             TIDY_DELETED=$(( TIDY_DELETED + 1 ))
+            TIDY_DONE+=("${b} (was ${sha})")
             info "deleted ${b} (was ${sha}) in ${repo/#$HOME/\~}"
         else
             # git's -d test is narrower than this plan's: it asks whether the
@@ -1554,6 +1563,7 @@ _tidy_apply() {
             # is the operator's call, and the sha above is enough to recover
             # either way.
             TIDY_FAILED=$(( TIDY_FAILED + 1 ))
+            TIDY_REFUSED+=("$b")
             TIDY_LINES+=("REFUSED  ${repo/#$HOME/\~}: ${b} (${sha}) — git -C ${repo/#$HOME/\~} branch -D ${b}  # contained in ${base}")
         fi
     done
@@ -1575,9 +1585,18 @@ cmd_tidy() {
     # fetched origin/trunk may hold commits the remote no longer has (Kamino
     # item 142). 'maintain --tidy' pulls first and measures against the
     # current one.
+    #
+    # Planned with the job runner, --jobs at a time (Kamino item 241); the
+    # plan is gathered in repo order, so it reads as it did one by one. On a
+    # terminal the repos being planned are drawn live and the block is
+    # cleared once the plan is printed in its place; elsewhere planning
+    # prints nothing of its own - the plan is its record.
     TIDY_PLAN=(); TIDY_NOTES=()
-    local i
-    for i in "${TARGETS[@]}"; do _tidy_plan_repo "${REPO_LIST[$i]}"; done
+    local jobs; jobs="$(_jobs)"
+    (( jobs <= ${#TARGETS[@]} )) || jobs=${#TARGETS[@]}
+    _live_init
+    _PAR_KIND=plan _PH0=planning
+    _par_run "$jobs" "${TARGETS[@]}"
 
     _tidy_print_plan
     (( ${#TIDY_PLAN[@]} )) || { info "Nothing to tidy: no local branch is already contained in its trunk."; return 0; }
@@ -1592,7 +1611,16 @@ cmd_tidy() {
         2) return 0 ;;   # declined — nothing was asked of git, nothing failed
         *) return 1 ;;   # could not ask: a deletion was requested and did not happen
     esac
-    _tidy_apply
+    # One line per repo with something to delete, one repo at a time: local
+    # `git branch -d`s, nothing to gain from more.
+    local i p dels=()
+    for i in "${TARGETS[@]}"; do
+        for p in "${TIDY_PLAN[@]}"; do
+            [[ "$p" == "${REPO_LIST[$i]}"$'\t'* ]] && { dels+=("$i"); break; }
+        done
+    done
+    _PAR_KIND=delete _PH0=deleting
+    _par_run 1 "${dels[@]}"
     printf '\n' >&2
     info "Summary: ${TIDY_DELETED} deleted, ${TIDY_FAILED} refused."
     if (( ${#TIDY_LINES[@]} )); then
@@ -1600,6 +1628,66 @@ cmd_tidy() {
         for l in "${TIDY_LINES[@]}"; do printf '          %s\n' "$l" >&2; done
     fi
     (( TIDY_FAILED == 0 ))
+}
+
+# _plan_body K — plans _PAR_TG[K]: its result is the count of plan entries,
+# the count of notes, then both.
+_plan_body() {
+    local k="$1" i="${_PAR_TG[$1]}"
+    local TIDY_PLAN=() TIDY_NOTES=()
+    _tidy_plan_repo "${REPO_LIST[$i]}"
+    _par_result "$k" "${#TIDY_PLAN[@]}" "${#TIDY_NOTES[@]}" "${TIDY_PLAN[@]}" "${TIDY_NOTES[@]}"
+}
+
+_flush_plan() {
+    local k="$1" rc="$2" i="${_PAR_TG[$1]}" np nn
+    if _res_read "$k"; then
+        np="${_RES[0]}"; nn="${_RES[1]}"
+        (( np == 0 )) || TIDY_PLAN+=("${_RES[@]:2:np}")
+        (( nn == 0 )) || TIDY_NOTES+=("${_RES[@]:2+np:nn}")
+    else
+        TIDY_NOTES+=("${REPO_LIST[$i]}: could not be planned (exit ${rc}) — left alone")
+    fi
+    if (( _LIVE_OPEN )); then printf '\r\033[2K' >&"$_LIVE_FD"; _LIVE_OPEN=0; fi
+    if (( VERBOSE )) && [[ -s "${_PAR_DIR}/${k}.err" ]]; then cat "${_PAR_DIR}/${k}.err" >&2; fi
+    return 0
+}
+
+# _delete_body K — deletes what the plan holds for _PAR_TG[K]: its result is
+# the deleted and refused counts, then tidy's REFUSED lines, the branches
+# deleted ("name (was sha)") and the ones refused, each list after its count.
+_delete_body() {
+    local k="$1" i="${_PAR_TG[$1]}" p mine=()
+    for p in "${TIDY_PLAN[@]}"; do [[ "$p" == "${REPO_LIST[$i]}"$'\t'* ]] && mine+=("$p"); done
+    local TIDY_PLAN=("${mine[@]}") TIDY_DELETED=0 TIDY_FAILED=0 TIDY_LINES=() TIDY_DONE=() TIDY_REFUSED=()
+    _tidy_apply
+    _par_result "$k" "$TIDY_DELETED" "$TIDY_FAILED" "${#TIDY_LINES[@]}" "${#TIDY_DONE[@]}" \
+        "${TIDY_LINES[@]}" "${TIDY_DONE[@]}" "${TIDY_REFUSED[@]}"
+}
+
+_flush_delete() {
+    local k="$1" rc="$2" nl nd details="$VERBOSE" dl=() refused=() x
+    if _res_read "$k"; then
+        TIDY_DELETED=$(( TIDY_DELETED + _RES[0] )); TIDY_FAILED=$(( TIDY_FAILED + _RES[1] ))
+        nl="${_RES[2]}"; nd="${_RES[3]}"
+        (( nl == 0 )) || TIDY_LINES+=("${_RES[@]:4:nl}")
+        (( nd == 0 )) || dl=("${_RES[@]:4+nl:nd}")
+        (( ${#_RES[@]} <= 4 + nl + nd )) || refused=("${_RES[@]:4+nl+nd}")
+        _TN=""
+        for x in "${dl[@]}"; do _TN+="${_TN:+, }${x}"; done
+        [[ -z "$_TN" ]] || _TN="deleted ${_TN}"
+        if (( ${#refused[@]} )); then
+            _TS=refused; details=1
+            local r=""
+            for x in "${refused[@]}"; do r+="${r:+, }${x}"; done
+            _TN="${r}${_TN:+; ${_TN}}"
+        else
+            _TS=ok
+        fi
+    else
+        _TS=FAILED; _TN="stopped unexpectedly (exit ${rc})"; details=1
+    fi
+    _par_emit "$k" "$_TS" "$_TN" "$details"
 }
 
 # -----------------------------------------------------------------------------
