@@ -18,7 +18,9 @@
 #
 # Nothing is pushed. A failed step is reported and the repo is left exactly as
 # that step left it — a stopped rebase stays stopped for whoever ran
-# maintenance to resolve — and the run moves on to the next repo. Repos that
+# maintenance to resolve — and the run moves on to the next repo. Up to
+# --jobs repos (default 4) are maintained at once, each one's report printed
+# whole and in order; --jobs 1 is one at a time. Repos that
 # are mid-rebase/merge, on a detached HEAD, or have neither main nor master are
 # skipped and reported, never touched.
 #
@@ -101,11 +103,15 @@ VERBOSE=0
 ONLY_REPO=""
 TIDY=0
 ASSUME_YES=0
+JOBS=""            # --jobs N; empty = the config's jobs=, else JOBS_DEFAULT
+JOBS_DEFAULT=4
+JOBS_MAX=64
 
 # ---- config (filled by load_config) -----------------------------------------
 ROOTS=()
 IGNORES=()
 ONBOARDED=0
+CONF_JOBS=""       # jobs= as written in the config (validated when used)
 
 usage() {
     cat >&2 <<EOF
@@ -136,6 +142,8 @@ FLAGS
   --repo PATH              maintain, tidy: limit to one discovered repo
   --dry-run                maintain, tidy: report what would happen, change nothing
   --tidy                   maintain: also tidy each repo once its pull has succeeded
+  --jobs N                 maintain: repos maintained at once, 1-${JOBS_MAX} (default ${JOBS_DEFAULT},
+                           or jobs= in the config); 1 = one at a time, as before
   --dry-run                prune: report the change, write nothing
   -y, --yes                tidy: delete without asking (required when there is no terminal)
   -v, --verbose            debug logging
@@ -150,6 +158,12 @@ repo whose origin/HEAD is develop) is never committed on: dirty, it is skipped.
 Nothing is pushed. A failed step leaves the repo as that step left it (a stopped
 rebase stays stopped for you to resolve) and the run moves on. Repos mid-rebase/
 merge, on a detached HEAD, or with neither main nor master are skipped.
+
+With more than one job, each repo's report is held until it and every repo
+before it are done, so the output reads as it does with --jobs 1. Nothing may
+prompt then: GIT_TERMINAL_PROMPT=0, and ssh runs with -o BatchMode=yes (added to
+GIT_SSH_COMMAND or core.sshCommand), so credentials must come from ssh-agent or
+a credential helper, as under cron; a repo that would ask fails instead.
 
 prune is the adjacent git setting, and the distinction people trip over:
 fetch.prune drops stale origin/* REMOTE-TRACKING refs on every fetch, and
@@ -173,7 +187,7 @@ EOF
 # -----------------------------------------------------------------------------
 
 load_config() {
-    ROOTS=(); IGNORES=(); ONBOARDED=0
+    ROOTS=(); IGNORES=(); ONBOARDED=0; CONF_JOBS=""
     [[ -f "$CONFIG_FILE" ]] || return 0
     local line key val
     while IFS= read -r line || [[ -n "$line" ]]; do
@@ -184,6 +198,7 @@ load_config() {
             root)      ROOTS+=("$val") ;;
             ignore)    IGNORES+=("$val") ;;
             onboarded) ONBOARDED="$val" ;;
+            jobs)      CONF_JOBS="$val" ;;
             *)         warn "config: unknown key '${key}'" ;;
         esac
     done < "$CONFIG_FILE"
@@ -199,10 +214,25 @@ save_config() {
         echo "# astromech config — managed by astromech.sh; one key=value per line."
         echo "# root=<folder holding git repos>    ignore=<root>/<top-level folder to skip>"
         echo "onboarded=${ONBOARDED}"
+        [[ -z "$CONF_JOBS" ]] || echo "jobs=${CONF_JOBS}"
         for r in "${ROOTS[@]}";   do echo "root=${r}"; done
         for i in "${IGNORES[@]}"; do echo "ignore=${i}"; done
     } > "$tmp"
     mv "$tmp" "$CONFIG_FILE"
+}
+
+_jobs_valid() { [[ "$1" =~ ^[0-9]+$ ]] && (( 10#$1 >= 1 && 10#$1 <= JOBS_MAX )); }
+
+# _jobs — echoes how many repos maintain runs at once: --jobs, else the
+# config's jobs=, else the default. A bad jobs= in the config is named and
+# ignored rather than fatal: a typo there must not stop every cron run.
+_jobs() {
+    if [[ -n "$JOBS" ]]; then printf '%d' "$((10#$JOBS))"; return; fi
+    if [[ -n "$CONF_JOBS" ]]; then
+        if _jobs_valid "$CONF_JOBS"; then printf '%d' "$((10#$CONF_JOBS))"; return; fi
+        warn "config: jobs=${CONF_JOBS} is not a number from 1 to ${JOBS_MAX} — using ${JOBS_DEFAULT}"
+    fi
+    printf '%d' "$JOBS_DEFAULT"
 }
 
 # _abspath PATH — echoes the absolute, ~-expanded path of an existing directory.
@@ -294,7 +324,8 @@ _deepest_root() {
     printf '%s' "$best"
 }
 
-# Fills REPO_LIST / REPO_ROOT (parallel arrays), one entry per repository.
+# Fills REPO_LIST / REPO_ROOT / REPO_KEY (parallel arrays), one entry per
+# repository; REPO_KEY is its shared git dir (or its path, if git cannot say).
 #
 # A linked worktree is part of its repository, not a second one: discovered as
 # one, status listed its branch twice, tidy deleted it from one side and then
@@ -309,9 +340,9 @@ _deepest_root() {
 # is checked out in the primary worktree, so the checkout would fail, and a
 # wip commit on its branch is exactly what item 141 removed. Covering it means
 # adding the repository's own folder as a root.
-REPO_LIST=(); REPO_ROOT=()
+REPO_LIST=(); REPO_ROOT=(); REPO_KEY=()
 discover() {
-    REPO_LIST=(); REPO_ROOT=()
+    REPO_LIST=(); REPO_ROOT=(); REPO_KEY=()
     local -A seen=() orphans=()
     local root repo key
     for root in "${ROOTS[@]}"; do
@@ -326,7 +357,7 @@ discover() {
             key="$(_common_dir "$repo" || printf '%s' "$repo")"
             [[ -n "${seen[$key]:-}" ]] && continue
             seen[$key]=1
-            REPO_LIST+=("$repo"); REPO_ROOT+=("$(_deepest_root "$repo")")
+            REPO_LIST+=("$repo"); REPO_ROOT+=("$(_deepest_root "$repo")"); REPO_KEY+=("$key")
         done < <(_walk "$root" 0)
     done
     local primary
@@ -646,32 +677,18 @@ cmd_maintain() {
     fi
     info "Maintaining ${#targets[@]} repo(s)…"
 
-    local n_ok=0 n_skip=0 n_fail=0 rel lines=() stashed=() ns
-    for i in "${targets[@]}"; do
-        rel="${REPO_LIST[$i]#"${REPO_ROOT[$i]}"/}"
-        [[ "${REPO_LIST[$i]}" == "${REPO_ROOT[$i]}" ]] && rel="."
-        printf '\n%s%s── %s%s  %s\n' "$(_pfx)" "$C_B" "$rel" "$C_N" "(${REPO_ROOT[$i]/#$HOME/\~})" >&2
-        maintain_repo "${REPO_LIST[$i]}"
-        case "$R_STATUS" in
-            ok)      n_ok=$((n_ok + 1))
-                     # Only after a repo came back clean and up to date: the
-                     # pull is what makes origin/<trunk> current, and tidying
-                     # against a stale one would spare branches it already
-                     # holds. A repo that was skipped or failed keeps all of
-                     # its branches.
-                     if (( TIDY )); then
-                         TIDY_PLAN=(); TIDY_NOTES=()
-                         _tidy_plan_repo "${REPO_LIST[$i]}"
-                         if (( DRY_RUN )); then _tidy_print_plan
-                         else _tidy_apply; fi
-                     fi
-                     ;;
-            skipped) n_skip=$((n_skip + 1));  lines+=("skipped  ${REPO_LIST[$i]/#$HOME/\~}: ${R_NOTE}") ;;
-            failed)  n_fail=$((n_fail + 1));  lines+=("FAILED   ${REPO_LIST[$i]/#$HOME/\~}: ${R_NOTE}") ;;
-        esac
-        ns="$(_stashes "${REPO_LIST[$i]}")"
-        (( ns )) && stashed+=("stashes  ${REPO_LIST[$i]/#$HOME/\~}: ${ns} kept (git -C ${REPO_LIST[$i]/#$HOME/\~} stash list)")
-    done
+    local jobs; jobs="$(_jobs)"
+    (( jobs <= ${#targets[@]} )) || jobs=${#targets[@]}
+
+    local n_ok=0 n_skip=0 n_fail=0 lines=() stashed=()
+    if (( jobs > 1 )); then
+        _maintain_parallel "$jobs" "${targets[@]}"
+    else
+        for i in "${targets[@]}"; do
+            _maintain_one "$i"
+            _maintain_tally "$i" "$(_stashes "${REPO_LIST[$i]}")"
+        done
+    fi
 
     printf '\n' >&2
     info "Summary: ${n_ok} ok, ${n_skip} skipped, ${n_fail} failed."
@@ -680,6 +697,243 @@ cmd_maintain() {
     (( ${#stashed[@]} )) && info "Stashes: ${#stashed[@]} repo(s) hold changes astromech stashed and nobody has picked up."
     for l in "${lines[@]}" "${TIDY_LINES[@]}" "${stashed[@]}"; do printf '          %s\n' "$l" >&2; done
     (( n_fail == 0 && TIDY_FAILED == 0 ))
+}
+
+# _maintain_one I — one repo's whole job: its heading, maintain_repo, and its
+# tidy. Leaves R_STATUS/R_NOTE and adds to TIDY_DELETED/TIDY_FAILED/TIDY_LINES.
+_maintain_one() {
+    local i="$1" rel
+    rel="${REPO_LIST[$i]#"${REPO_ROOT[$i]}"/}"
+    [[ "${REPO_LIST[$i]}" == "${REPO_ROOT[$i]}" ]] && rel="."
+    printf '\n%s%s── %s%s  %s\n' "$(_pfx)" "$C_B" "$rel" "$C_N" "(${REPO_ROOT[$i]/#$HOME/\~})" >&2
+    maintain_repo "${REPO_LIST[$i]}"
+    # Only after a repo came back clean and up to date: the pull is what makes
+    # origin/<trunk> current, and tidying against a stale one would spare
+    # branches it already holds. A repo that was skipped or failed keeps all
+    # of its branches.
+    if [[ "$R_STATUS" == ok ]] && (( TIDY )); then
+        TIDY_PLAN=(); TIDY_NOTES=()
+        _tidy_plan_repo "${REPO_LIST[$i]}"
+        if (( DRY_RUN )); then _tidy_print_plan
+        else _tidy_apply; fi
+    fi
+    return 0
+}
+
+# _maintain_tally I STASHES — counts the result of repo I (R_STATUS/R_NOTE)
+# into cmd_maintain's totals and summary lines.
+_maintain_tally() {
+    local i="$1" ns="$2"
+    case "$R_STATUS" in
+        ok)      n_ok=$((n_ok + 1)) ;;
+        skipped) n_skip=$((n_skip + 1));  lines+=("skipped  ${REPO_LIST[$i]/#$HOME/\~}: ${R_NOTE}") ;;
+        failed)  n_fail=$((n_fail + 1));  lines+=("FAILED   ${REPO_LIST[$i]/#$HOME/\~}: ${R_NOTE}") ;;
+    esac
+    (( ns )) && stashed+=("stashes  ${REPO_LIST[$i]/#$HOME/\~}: ${ns} kept (git -C ${REPO_LIST[$i]/#$HOME/\~} stash list)")
+    return 0
+}
+
+# -----------------------------------------------------------------------------
+# maintain, several repos at once (Kamino item 238)
+# -----------------------------------------------------------------------------
+#
+# A pull is network-bound, so one repo at a time made a run as long as the sum
+# of its pulls. With --jobs N, up to N repos run their whole job (maintain_repo,
+# then its tidy) at once, each in a background subshell:
+#
+#   - its output goes to a buffer of its own, and its result (R_STATUS/R_NOTE,
+#     tidy's counts and REFUSED lines, its stash count) to a file - a subshell
+#     cannot set the parent's globals. The parent prints a repo as soon as it
+#     and every repo before it are done, so the report reads exactly as with
+#     --jobs 1 and still streams;
+#   - two repos whose git dirs are the same or nested never run at once. One
+#     entry per git dir is already discovery's rule; a submodule's git dir
+#     (inside the superproject's .git/modules) is the nested case, written by
+#     the superproject's own pull too (fetch.recurseSubmodules=on-demand);
+#   - nothing may prompt: no one could answer, and a background job reading the
+#     terminal would stop the run for good. GIT_TERMINAL_PROMPT=0, ssh gets
+#     -o BatchMode=yes, stdin is /dev/null, and SIGTTIN/SIGTTOU are ignored so
+#     anything else that opens /dev/tty gets an error rather than a stop;
+#   - a job that dies without its result - errexit, a signal - is that repo's
+#     failure, never the run's (Kamino item 170's rule, kept here);
+#   - each job is its own process group, so Ctrl-C/TERM/HUP stops the jobs and
+#     every git under them, and the EXIT trap still releases the run lock.
+
+_PAR_DIR=""; _PAR_SAME=0; _PAR_TG=(); _PAR_PID=(); _PAR_STATE=()   # 0 waiting, 1 running, 2 done, 3 printed
+
+_par_cleanup() { [[ -z "$_PAR_DIR" ]] || rm -rf "$_PAR_DIR"; _PAR_DIR=""; }
+
+# _batch_ssh REPO — makes ssh non-interactive for REPO's git without losing
+# the ssh command it would have used: GIT_SSH_COMMAND, else core.sshCommand
+# (git's own order), else plain ssh. GIT_SSH names a program, which cannot be
+# given options; it is left alone (and said so once, in _maintain_parallel).
+_batch_ssh() {
+    local cmd="${GIT_SSH_COMMAND:-}"
+    if [[ -z "$cmd" ]]; then
+        cmd="$(git -C "$1" config --get core.sshCommand 2>/dev/null || true)"
+        [[ -z "$cmd" && -n "${GIT_SSH:-}" ]] && return 0
+    fi
+    export GIT_SSH_COMMAND="${cmd:-ssh} -o BatchMode=yes"
+}
+
+# _maintain_job K — the background job for _PAR_TG[K]. Its result file is
+# written last and renamed into place: no file means the job did not finish.
+_maintain_job() {
+    local k="$1" i="${_PAR_TG[$1]}" ns res="${_PAR_DIR}/$1.res"
+    trap - EXIT INT TERM HUP
+    trap '' TTIN TTOU
+    _batch_ssh "${REPO_LIST[$i]}"
+    TIDY_DELETED=0; TIDY_FAILED=0; TIDY_LINES=()
+    _maintain_one "$i"
+    ns="$(_stashes "${REPO_LIST[$i]}")"
+    {
+        printf '%s\0' "$R_STATUS" "$R_NOTE" "$TIDY_DELETED" "$TIDY_FAILED" "$ns"
+        (( ${#TIDY_LINES[@]} == 0 )) || printf '%s\0' "${TIDY_LINES[@]}"
+    } > "${res}.tmp"
+    mv -f "${res}.tmp" "$res"
+}
+
+# _par_conflict K — 0 when a running job's git dir is K's, or holds it, or
+# lies inside it.
+_par_conflict() {
+    local a="${REPO_KEY[${_PAR_TG[$1]}]}" b m
+    for m in "${!_PAR_STATE[@]}"; do
+        (( _PAR_STATE[m] == 1 )) || continue
+        b="${REPO_KEY[${_PAR_TG[$m]}]}"
+        [[ "$a" == "$b" || "$a" == "$b"/* || "$b" == "$a"/* ]] && return 0
+    done
+    return 1
+}
+
+_par_spawn() {
+    local k="$1" d="$_PAR_DIR"
+    # Job control on for the fork only: each job then gets a process group of
+    # its own, which _par_abort can signal whole.
+    set -m
+    if (( _PAR_SAME )); then
+        ( _maintain_job "$k" ) </dev/null >"${d}/${k}.err" 2>&1 &
+    else
+        ( _maintain_job "$k" ) </dev/null >"${d}/${k}.out" 2>"${d}/${k}.err" &
+    fi
+    _PAR_PID[k]=$!
+    set +m
+    _PAR_STATE[k]=1
+}
+
+# _par_replay K — job K's output, to where --jobs 1 would have written it.
+_par_replay() {
+    local d="$_PAR_DIR"
+    [[ -f "${d}/$1.err" ]] && cat "${d}/$1.err" >&2
+    [[ -f "${d}/$1.out" ]] && cat "${d}/$1.out"
+    return 0
+}
+
+# _par_flush K RC — prints job K and counts its result.
+_par_flush() {
+    local k="$1" rc="$2" i="${_PAR_TG[$1]}" f=() x ns
+    _par_replay "$k"
+    if [[ -f "${_PAR_DIR}/${k}.res" ]]; then
+        while IFS= read -r -d '' x; do f+=("$x"); done < "${_PAR_DIR}/${k}.res"
+        R_STATUS="${f[0]}"; R_NOTE="${f[1]}"; ns="${f[4]}"
+        TIDY_DELETED=$(( TIDY_DELETED + f[2] )); TIDY_FAILED=$(( TIDY_FAILED + f[3] ))
+        (( ${#f[@]} > 5 )) && TIDY_LINES+=("${f[@]:5}")
+    else
+        R_STATUS=failed
+        R_NOTE="maintenance stopped unexpectedly (exit ${rc}) — the repo may be mid-step; look at it with git status"
+        error "$R_NOTE"
+        ns="$(_stashes "${REPO_LIST[$i]}")"
+    fi
+    _maintain_tally "$i" "$ns"
+    _PAR_STATE[k]=3
+}
+
+# _par_alive K... — 0 while anything in one of these jobs' process groups runs.
+_par_alive() {
+    local k
+    for k in "$@"; do kill -0 -- "-${_PAR_PID[k]}" 2>/dev/null && return 0; done
+    return 1
+}
+
+# _par_abort SIGNAL — the INT/TERM/HUP trap while jobs run: stop every job's
+# process group, print what the started repos reported, and exit; the EXIT
+# trap then removes the buffers and releases the run lock.
+_par_abort() {
+    local sig="$1" k n code=130 stopped=()
+    trap '' INT TERM HUP
+    set +m   # in case the signal landed inside _par_spawn
+    case "$sig" in TERM) code=143 ;; HUP) code=129 ;; esac
+    for k in "${!_PAR_STATE[@]}"; do
+        (( _PAR_STATE[k] == 1 )) || continue
+        kill -TERM -- "-${_PAR_PID[k]}" 2>/dev/null || true
+        stopped+=("$k")
+    done
+    # A few seconds for git to remove its own lock files, then no more.
+    for (( n = 0; n < 50; n++ )); do
+        (( ${#stopped[@]} )) && _par_alive "${stopped[@]}" || break
+        sleep 0.1
+    done
+    for k in "${stopped[@]}"; do
+        kill -KILL -- "-${_PAR_PID[k]}" 2>/dev/null || true
+        wait "${_PAR_PID[k]}" 2>/dev/null || true
+    done
+    # Everything started and not yet printed, in order; a job that was still
+    # running is reported stopped unless its result shows it had finished.
+    local names=()
+    for k in "${!_PAR_STATE[@]}"; do
+        (( _PAR_STATE[k] == 1 || _PAR_STATE[k] == 2 )) || continue
+        _par_replay "$k"
+        if (( _PAR_STATE[k] == 1 )) && [[ ! -f "${_PAR_DIR}/${k}.res" ]]; then
+            error "stopped by SIG${sig} — this repo may be mid-step; look at it with git status"
+            names+=("${REPO_LIST[${_PAR_TG[$k]}]/#$HOME/\~}")
+        fi
+    done
+    printf '\n' >&2
+    warn "interrupted (SIG${sig}): ${#names[@]} repo(s) stopped mid-job${names[*]:+: ${names[*]}}; repos not started were not maintained."
+    exit "$code"
+}
+
+# _maintain_parallel JOBS IDX... — runs the repos REPO_LIST[IDX], JOBS at a
+# time, printing and counting each in order. Polled, not 'wait -n': that needs
+# bash 4.3 and cannot say which job ended before 5.1.
+_maintain_parallel() {
+    local jobs="$1"; shift
+    _PAR_TG=("$@"); _PAR_PID=(); _PAR_STATE=()
+    local n=$# k rc running=0 printed=0 progress rcs=()
+    _PAR_DIR="$(mktemp -d "${TMPDIR:-/tmp}/astromech.XXXXXX")" \
+        || error_exit "cannot create a directory for the jobs' output under ${TMPDIR:-/tmp} (run with --jobs 1)"
+    trap '_par_cleanup; _release_lock' EXIT
+    trap '_par_abort INT' INT; trap '_par_abort TERM' TERM; trap '_par_abort HUP' HUP
+    # One stream or two: what --jobs 1 writes to a shared terminal or file
+    # interleaves stdout with stderr, and has to come back that way.
+    _PAR_SAME=0; [[ /dev/fd/1 -ef /dev/fd/2 ]] && _PAR_SAME=1
+    export GIT_TERMINAL_PROMPT=0
+    info "Up to ${jobs} repos at a time (--jobs 1 for one at a time). Nothing may prompt: GIT_TERMINAL_PROMPT=0 and ssh -o BatchMode=yes, so credentials must come from ssh-agent or a credential helper."
+    if [[ -n "${GIT_SSH:-}" && -z "${GIT_SSH_COMMAND:-}" ]]; then
+        warn "GIT_SSH is set (${GIT_SSH}): a program, so BatchMode cannot be added to it - it must not prompt either. GIT_SSH_COMMAND would let astromech add it."
+    fi
+    for (( k = 0; k < n; k++ )); do _PAR_STATE[k]=0; done
+
+    while (( printed < n )); do
+        progress=0
+        for (( k = printed; k < n; k++ )); do
+            (( _PAR_STATE[k] == 1 )) || continue
+            kill -0 "${_PAR_PID[k]}" 2>/dev/null && continue
+            rc=0; wait "${_PAR_PID[k]}" || rc=$?
+            _PAR_STATE[k]=2; rcs[k]=$rc; running=$(( running - 1 )); progress=1
+        done
+        for (( k = printed; k < n && running < jobs; k++ )); do
+            (( _PAR_STATE[k] == 0 )) || continue
+            _par_conflict "$k" && continue
+            _par_spawn "$k"; running=$(( running + 1 )); progress=1
+        done
+        while (( printed < n )) && (( _PAR_STATE[printed] == 2 )); do
+            _par_flush "$printed" "${rcs[printed]}"
+            printed=$(( printed + 1 )); progress=1
+        done
+        (( progress )) || sleep 0.1
+    done
+    trap - INT TERM HUP
+    return 0
 }
 
 # -----------------------------------------------------------------------------
@@ -1120,6 +1374,7 @@ cmd_config() {
     printf 'onboarded=%s\n' "$ONBOARDED"
     printf 'roots=%d\n' "${#ROOTS[@]}"
     printf 'ignores=%d\n' "${#IGNORES[@]}"
+    printf 'jobs=%d\n' "$(_jobs)"
 }
 
 cmd_mark_onboarded() { load_config; ONBOARDED=1; save_config; }
@@ -1228,6 +1483,8 @@ main() {
             --repo=*)     ONLY_REPO="${1#*=}"; shift ;;
             --dry-run)    DRY_RUN=1; shift ;;
             --tidy)       TIDY=1; shift ;;
+            --jobs)       [[ $# -ge 2 ]] || error_exit "--jobs needs a number"; JOBS="$2"; shift 2 ;;
+            --jobs=*)     JOBS="${1#*=}"; shift ;;
             -y|--yes)     ASSUME_YES=1; shift ;;
             -v|--verbose) VERBOSE=1; shift ;;
             -h|--help)    usage; exit 0 ;;
@@ -1237,6 +1494,7 @@ main() {
         esac
     done
 
+    [[ -z "$JOBS" ]] || _jobs_valid "$JOBS" || error_exit "--jobs: expected a number from 1 to ${JOBS_MAX}, got '${JOBS}'"
     case "$cmd" in maintain|tidy|status|repos|prune) _require_git ;; esac
     case "$cmd" in
         maintain)       cmd_maintain ;;

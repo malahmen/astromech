@@ -24,6 +24,10 @@ the way that step left it, and goes on to the next repo. A rebase that hits a
 conflict stays stopped, so whoever ran maintenance can resolve it
 (`git status`, then `git rebase --continue` or `--abort`).
 
+Up to four repos are maintained at once (`--jobs N`, see
+[Parallel runs](#parallel-runs)); the report still reads one repo after
+another, in order.
+
 These repos are **skipped and reported**, never touched:
 
 - a rebase, merge, cherry-pick, revert or bisect is in progress
@@ -194,6 +198,41 @@ Otherwise that's a thing you find out by wondering why one repo never prunes.
 remote no longer has, which is a much bigger promise than dropping a stale
 branch ref, and nothing here needs it.
 
+## Parallel runs
+
+A pull waits on the network, so one repo at a time made a run as long as the
+sum of its pulls. `maintain` runs up to `--jobs N` repos at once — default 4,
+or `jobs=` in the config; `--jobs 1` is one at a time, exactly as before. A
+run then takes about as long as its slowest pulls. On 20 real clones pulling
+from GitHub over ssh, 49-109 s one at a time became 16 s with four jobs and
+11-13 s with eight.
+
+- **The same report.** Each repo's whole job (maintain, then its tidy with
+  `--tidy`) runs in the background with its output held back; a repo is
+  printed as soon as it and every repo before it are done. The sections, the
+  summary and the exit status are byte for byte those of `--jobs 1`, and one
+  extra line says how many run at once. With stdout and stderr on different
+  files each keeps its own stream.
+- **One git dir, one job.** Two repos whose git dirs are the same, or one
+  inside the other (a submodule's, under its superproject's `.git/modules`, is
+  written by the superproject's pull too), never run at the same time.
+- **Nothing prompts.** Nobody could answer, and a background job reading the
+  terminal would stop the run for good. So `GIT_TERMINAL_PROMPT=0`, and ssh
+  runs with `-o BatchMode=yes`, appended to your `GIT_SSH_COMMAND` or to the
+  repo's `core.sshCommand` when there is one. Credentials must come from
+  `ssh-agent` or a credential helper, as under cron; a repo that would ask
+  fails, saying why, and the rest carry on. `GIT_SSH` (a program, not a command
+  line) cannot be given options, so it is left alone with a warning. A key that
+  needs its passphrase typed means `--jobs 1`, or `ssh-add` first.
+- **A crash is one repo's failure.** A job that dies without its result — a
+  shell error, a signal — is reported `FAILED` for its repo; the others are
+  maintained and counted as usual.
+- **Ctrl-C** (or TERM, HUP) stops every job and every git under it, prints
+  what the started repos reported, names the ones stopped mid-job, releases
+  the run lock and exits 130 (143, 129).
+
+A single repo (`--repo`, or only one discovered) always runs the old way.
+
 ## Front-end
 
 The interactive experience (first-run setup, multi-select ignore picker, menu)
@@ -218,6 +257,7 @@ astromech.sh status                          # tree: repos [branch *dirty, N sta
 astromech.sh maintain --dry-run              # what would happen
 astromech.sh maintain                        # do it
 astromech.sh maintain --repo ~/code/api      # just one repo
+astromech.sh maintain --jobs 8               # eight repos at a time (default 4; 1 = one by one)
 astromech.sh tidy --dry-run                  # merged local branches, listed
 astromech.sh tidy                            # …then ask, then delete them
 astromech.sh --help
@@ -225,7 +265,7 @@ astromech.sh --help
 
 | Command | Does |
 | --- | --- |
-| `maintain` | run maintenance on every discovered repo (`--repo`, `--dry-run`, `--tidy`) |
+| `maintain` | run maintenance on every discovered repo (`--repo`, `--dry-run`, `--tidy`, `--jobs N`) |
 | `tidy` | list local branches already merged into the trunk, then delete them (`--repo`, `--dry-run`, `--yes`) |
 | `prune [on\|off]` | show or toggle git's `fetch.prune`, with what it does and does not prune, and any repo overriding it (`--dry-run`) |
 | `status` | per root: repos (relative path, branch, `*` if dirty), the branches `tidy` would delete, and ignored folders |
@@ -264,10 +304,15 @@ ignored folder's whole subtree is skipped.
 
 ```
 onboarded=1
+jobs=4
 root=/Users/me/code
 root=/Users/me/work
 ignore=/Users/me/code/archive
 ```
+
+`jobs=` (1-64, optional) is `maintain`'s default for `--jobs`; the flag wins.
+astromech never writes it, only keeps it; a value that is not a number in range
+is named in a warning and the default of 4 used.
 
 ## Cron
 
@@ -277,6 +322,8 @@ ignore=/Users/me/code/archive
 
 Without a terminal, log lines get a UTC timestamp and `GIT_TERMINAL_PROMPT=0` is
 set, so an HTTPS remote that needs credentials fails instead of hanging the run.
+With more than one job (the default) that holds with a terminal too, and ssh
+gets `BatchMode=yes` (see [Parallel runs](#parallel-runs)).
 
 `maintain` and `tidy` take one run lock per user,
 `~/.local/state/astromech/run.lock`, so a cron run and one started by hand
@@ -318,12 +365,20 @@ are what the skip conditions below depend on.
 | `test-trunks-worktrees.sh` | 47 | long-lived branches: never tidied, never wip-committed by `maintain`; linked worktrees (one stray outside every root is named); a branch rebased or bisected elsewhere; deepest-root attribution; `status` taking no optional locks |
 | `test-locked.sh` | 17 | the run lock: a stale one whose holder is gone, one path whatever the environment, never visible without its pid |
 | `test-default-branch.sh` | 10 | which branch is the trunk, in the orders that matter |
+| `test-jobs.sh` | 58 | `--jobs`: the same report as one at a time, totals that add up, nested git dirs never at once, prompts that fail instead of hanging, a crashed job, Ctrl-C/TERM releasing the lock |
 
-**259 checks** in total.
+**317 checks** in total.
 
 `test-prune.sh` writes to a global git config, so it first proves git honours
 `$GIT_CONFIG_GLOBAL` (2.32+) and skips itself if not — the real `~/.gitconfig`
 is not an acceptable place to find that out.
+
+`test-jobs.sh` answers nothing over the network either: a stub `git` delays
+or hangs a pull and logs when it starts and ends, a stub `ssh` and a remote
+helper stand in for a prompt nobody answers, and a stub `date` makes one job
+crash. Its credential check needs python's `pty` (a terminal on stdin is the
+only case in which one-at-a-time maintenance would prompt) and its Ctrl-C
+check needs `perl`; each is skipped, not failed, without them.
 
 `test-tidy.sh` needs `setsid` to observe the confirmation gate refusing with no
 controlling terminal, and python's `pty` to answer the question with one. It
