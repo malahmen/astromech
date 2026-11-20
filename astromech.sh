@@ -668,6 +668,13 @@ maintain_repo() {
 # its pid. With mkdir-then-write, a second run arriving in between read an
 # empty pid, called the lock stale and removed it from under its live holder.
 #
+# Android allows no hard links in an app's data (Termux there: link(2) is
+# refused by SELinux, whoever holds the lock), and every run said "another
+# run is in progress". When ln fails and there is no lock, the link itself was
+# refused; the lock is then created with noclobber (O_EXCL), just as atomic
+# but briefly empty before its pid is written - so an empty lock is read again
+# before it is called stale.
+#
 # The lock outlives a reboot (it is no longer on a tmpfs), so it records the
 # boot too: after a reboot its pid may belong to some unrelated new process,
 # which must not block maintenance forever.
@@ -685,7 +692,11 @@ _lock_take() {
     local f="$1" tmp rc=0
     tmp="$(mktemp "${f%/*}/.run.lock.XXXXXX")" || return 1
     printf '%s\n%s\n' "$$" "$(_boot_id)" > "$tmp" || rc=1
-    (( rc )) || ln "$tmp" "$f" 2>/dev/null || rc=1
+    if (( ! rc )) && ! ln "$tmp" "$f" 2>/dev/null; then
+        rc=1
+        # No lock, yet ln failed: hard links are refused here (Android).
+        if [[ ! -e "$f" ]] && ( set -o noclobber; cat "$tmp" > "$f" ) 2>/dev/null; then rc=0; fi
+    fi
     rm -f "$tmp"
     return "$rc"
 }
@@ -700,6 +711,8 @@ _run_lock() {
     # maintenance forever: that turns one killed run into a silent stop.
     local held old cur=""
     held="$(cat "$f" 2>/dev/null)" || held=""
+    # Empty: maybe a holder between its noclobber create and its write.
+    if [[ -z "$held" && -e "$f" ]]; then sleep 1; held="$(cat "$f" 2>/dev/null)" || held=""; fi
     # Gone since (its holder finished): just try again. Present but empty
     # cannot come from a live run any more, so it is stale like a dead pid.
     if [[ -e "$f" ]]; then
@@ -714,7 +727,7 @@ _run_lock() {
         mv -f "$f" "$old" 2>/dev/null || return 1
         cur="$(cat "$old" 2>/dev/null)" || cur=""
         if [[ "$cur" != "$held" ]]; then
-            ln "$old" "$f" 2>/dev/null || true
+            ln "$old" "$f" 2>/dev/null || mv -n "$old" "$f" 2>/dev/null || true
             rm -f "$old"
             return 1
         fi
