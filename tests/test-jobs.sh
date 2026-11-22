@@ -282,10 +282,12 @@ unset ASTROMECH_CONFIG
 
 echo "## 6. a job that crashes fails its repo, not the run"
 # date +%F (maintain_repo's stamp) fails once: errexit ends that repo's job
-# mid-step, without a result.
+# mid-step, without a result. "Once" is bash's noclobber (O_EXCL), not mkdir:
+# uutils' mkdir (Ubuntu 26.04's) let two racing jobs both
+# "create" the directory, and two repos crashed (CI, 2026-11-20).
 cat > "$STUB/date" <<STUB
 #!/usr/bin/env bash
-if [[ "\${1:-}" == +%F && -n "\${CRASH_ONCE:-}" ]] && mkdir "\$CRASH_ONCE" 2>/dev/null; then exit 1; fi
+if [[ "\${1:-}" == +%F && -n "\${CRASH_ONCE:-}" ]] && ( set -C; : > "\$CRASH_ONCE" ) 2>/dev/null; then exit 1; fi
 exec "$REALDATE" "\$@"
 STUB
 chmod +x "$STUB/date"
