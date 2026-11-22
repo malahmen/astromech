@@ -115,6 +115,48 @@ wait "$first"
 check "neither run calls the other's lock stale"          bash -c '! grep -qi "stale run lock" "$1" "$2"' _ "$T/a.out" "$T/b.out"
 check "no lock is left behind"                            [ ! -e "$LOCK" ]
 
+echo "## no hard links (Android: Termux on a phone)"
+# Android refuses link(2) in an app's data whoever holds the lock; every run
+# said "another run is in progress". An ln that refuses the same way:
+nolink="$T/nolink"; mkdir -p "$nolink"
+cat > "$nolink/ln" <<'STUB'
+#!/usr/bin/env bash
+for a in "$@"; do [[ "$a" == -* ]] || { echo "ln: failed to create hard link '${a}': Permission denied" >&2; exit 1; }; done
+exit 1
+STUB
+chmod +x "$nolink/ln"
+out6="$(PATH="$nolink:$PATH" bash "$AM" maintain 2>&1)"
+check "maintain runs without hard links"                  grep -q "Summary:" <<<"$out6"
+check "  not refused as 'in progress'"                    bash -c '! grep -q "in progress" <<<"$1"' _ "$out6"
+check "  and its lock is released"                        [ ! -e "$LOCK" ]
+sleep 30 & holder=$!
+printf '%s\n' "$holder" > "$LOCK"
+out7="$(PATH="$nolink:$PATH" bash "$AM" maintain 2>&1)"; rc7=$?
+check "a live holder is still respected"                  [ "$rc7" -ne 0 ]
+check "  and said so"                                     grep -q "in progress" <<<"$out7"
+kill "$holder" 2>/dev/null; wait "$holder" 2>/dev/null
+printf '%s\n' "$holder" > "$LOCK"
+out8="$(PATH="$nolink:$PATH" bash "$AM" maintain 2>&1)"
+check "a dead holder's lock is still reclaimed"           grep -qi "stale run lock" <<<"$out8"
+check "  and released afterwards"                         [ ! -e "$LOCK" ]
+# Without ln the lock is created, then its pid written: a cat that pauses a
+# second before writing it holds that window open. A second run arriving
+# then must wait for the pid, not call the lock stale.
+realcat="$(command -v cat)"
+cat > "$nolink/cat" <<STUB
+#!/usr/bin/env bash
+case "\${1:-}" in *"/.run.lock."*) if rm "$T/pause-cat" 2>/dev/null; then sleep 1; fi ;; esac
+exec "$realcat" "\$@"
+STUB
+chmod +x "$nolink/cat"; : > "$T/pause-cat"
+PATH="$nolink:$PATH" bash "$AM" maintain > "$T/c.out" 2>&1 & first=$!
+for _ in $(seq 50); do [ -e "$T/pause-cat" ] || break; sleep 0.1; done
+PATH="$nolink:$PATH" bash "$AM" maintain > "$T/d.out" 2>&1
+wait "$first"
+check "an empty lock (pid not yet written) is not stale"  bash -c '! grep -qi "stale run lock" "$1" "$2"' _ "$T/c.out" "$T/d.out"
+check "  one of the two runs maintained"                  grep -q "Summary:" "$T/c.out"
+check "  and no lock is left behind"                      [ ! -e "$LOCK" ]
+
 echo
 if (( FAILS )); then echo "${FAILS} check(s) failed"; exit 1; fi
 echo "all checks passed"
